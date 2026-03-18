@@ -572,6 +572,9 @@ type Listener struct {
 	port     uint32
 	ctx      context.Context
 	cancel   context.CancelFunc
+
+	connsMu sync.Mutex
+	conns   map[*Conn]net.Conn // tunnel conn → TCP conn, for cleanup on Close
 }
 
 // Listen creates a new listener on the specified local address
@@ -589,6 +592,7 @@ func (t *Tunnel) Listen(localAddr string, remotePort uint32) (*Listener, error) 
 		port:     remotePort,
 		ctx:      ctx,
 		cancel:   cancel,
+		conns:    make(map[*Conn]net.Conn),
 	}
 
 	go l.acceptLoop()
@@ -618,7 +622,6 @@ func (l *Listener) acceptLoop() {
 func (l *Listener) handleConn(tcpConn net.Conn) {
 	defer tcpConn.Close()
 
-	// Create a tunnel connection
 	tunnelConn, err := l.tunnel.Dial(l.port)
 	if err != nil {
 		log.Warn().Err(err).Msg("[dahua] failed to dial tunnel")
@@ -626,8 +629,16 @@ func (l *Listener) handleConn(tcpConn net.Conn) {
 	}
 	defer tunnelConn.Close()
 
-	// Bidirectional copy with half-close propagation:
-	// when one direction ends, close the other side to unblock it.
+	l.connsMu.Lock()
+	l.conns[tunnelConn] = tcpConn
+	l.connsMu.Unlock()
+
+	defer func() {
+		l.connsMu.Lock()
+		delete(l.conns, tunnelConn)
+		l.connsMu.Unlock()
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -651,8 +662,19 @@ func (l *Listener) Addr() net.Addr {
 	return l.listener.Addr()
 }
 
-// Close closes the listener
+// Close closes the listener and all active tunneled connections.
+// This sends DISC for each realm so the device frees resources immediately.
 func (l *Listener) Close() error {
 	l.cancel()
-	return l.listener.Close()
+	err := l.listener.Close()
+
+	l.connsMu.Lock()
+	for tunnelConn, tcpConn := range l.conns {
+		tunnelConn.Close()
+		tcpConn.Close()
+	}
+	l.conns = nil
+	l.connsMu.Unlock()
+
+	return err
 }
