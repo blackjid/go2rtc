@@ -263,17 +263,16 @@ func (m *SessionManager) Release(serial string) {
 		}
 		s.idleTimer = time.AfterFunc(m.IdleTimeout, func() {
 			m.mu.Lock()
-			defer m.mu.Unlock()
-
 			s2, ok := m.sessions[serial]
-			if !ok || s2 != s {
+			if !ok || s2 != s || s2.refCount > 0 {
+				m.mu.Unlock()
 				return
 			}
-			// Only close if still idle (no new Acquire since timer started)
-			if s2.refCount <= 0 {
-				s2.client.Close()
-				delete(m.sessions, serial)
-			}
+			delete(m.sessions, serial)
+			m.mu.Unlock()
+
+			// Close outside the lock to avoid deadlock with OnClose callback
+			s2.client.Close()
 		})
 	}
 }
