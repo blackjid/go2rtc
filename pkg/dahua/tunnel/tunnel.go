@@ -45,6 +45,7 @@ type Tunnel struct {
 	// For connection establishment
 	connCh   map[uint32]chan bool
 	connChMu sync.Mutex
+	dialMu   sync.Mutex // serializes Dial calls so BINDs don't overlap
 
 	// Heartbeat
 	heartbeatTicker *time.Ticker
@@ -313,6 +314,7 @@ func (t *Tunnel) sendACK() {
 }
 
 // Dial creates a new realm/connection to the specified port on the device.
+// Serialized via dialMu so the device processes one BIND at a time.
 // Retries the bind request up to 3 times since UDP packets can be lost.
 func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 	t.mu.RLock()
@@ -321,6 +323,14 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 		return nil, ErrTunnelClosed
 	}
 	t.mu.RUnlock()
+
+	// Serialize Dial calls: the device can't reliably handle concurrent BINDs
+	t.dialMu.Lock()
+	defer t.dialMu.Unlock()
+
+	if t.IsClosed() {
+		return nil, ErrTunnelClosed
+	}
 
 	dataCh := make(chan []byte, 4096)
 	connCh := make(chan bool, 1)
