@@ -208,8 +208,6 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 		})
 
 		delete(m.lastFailed, cfg.Serial)
-	} else {
-		m.lastFailed[cfg.Serial] = time.Now()
 	}
 	m.mu.Unlock()
 
