@@ -13,11 +13,44 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// NegotiateSettle is the maximum settle time between consecutive RTSP
+// negotiations. Adaptive settling will reduce this if the device is responsive.
+const NegotiateSettle = 5 * time.Second
+
+// minNegotiateSettle is the minimum settle time used when the device is
+// actively responding to heartbeats (indicating low load).
+const minNegotiateSettle = 1 * time.Second
+
 // Client represents a P2P connection to a Dahua device
 type Client struct {
-	tunnel      *tunnel.Tunnel
-	config      Config
-	NegotiateMu sync.Mutex // serializes RTSP negotiation; device can't handle concurrent SETUP
+	tunnel        *tunnel.Tunnel
+	config        Config
+	NegotiateMu   sync.Mutex // serializes RTSP negotiation; device can't handle concurrent SETUP
+	lastNegotiate time.Time  // when the last RTSP negotiation completed
+}
+
+// WaitSettle sleeps until the device is ready for a new RTSP negotiation.
+// It uses adaptive delays: if the tunnel is receiving packets from the
+// device (responsive), the settle time is reduced from 5s to 1s. Otherwise,
+// the full NegotiateSettle is enforced.
+func (c *Client) WaitSettle() {
+	if c.lastNegotiate.IsZero() {
+		return
+	}
+
+	settle := NegotiateSettle
+	if c.tunnel.IsResponsive(2 * time.Second) {
+		settle = minNegotiateSettle
+	}
+
+	if wait := settle - time.Since(c.lastNegotiate); wait > 0 {
+		time.Sleep(wait)
+	}
+}
+
+// DoneNegotiate records the current time as the end of an RTSP negotiation.
+func (c *Client) DoneNegotiate() {
+	c.lastNegotiate = time.Now()
 }
 
 // SetOnClose registers a callback invoked when the underlying tunnel closes
@@ -68,6 +101,11 @@ func (c *Client) IsClosed() bool {
 	return c.tunnel.IsClosed()
 }
 
+// ActiveRealms returns the number of active realms on the underlying tunnel.
+func (c *Client) ActiveRealms() int {
+	return c.tunnel.ActiveRealms()
+}
+
 // Listen creates a local TCP server that tunnels connections to the device
 func (c *Client) Listen(localAddr string, remotePort uint32) (*tunnel.Listener, error) {
 	return c.tunnel.Listen(localAddr, remotePort)
@@ -88,14 +126,20 @@ const DefaultIdleTimeout = 5 * time.Minute
 // HandshakeCooldown prevents hammering P2P servers after repeated failures.
 const HandshakeCooldown = 30 * time.Second
 
+// MaxRealmsPerTunnel is the maximum number of realms to multiplex on a single
+// P2P tunnel before opening a second tunnel. Dahua firmware becomes unstable
+// beyond 3-5 concurrent realms; 4 is a safe default.
+const MaxRealmsPerTunnel = 4
+
 // SessionManager manages shared P2P tunnels per serial with refcounting.
-// Tunnels persist for IdleTimeout after the last stream disconnects,
-// avoiding expensive P2P re-handshakes on reconnect.
+// Multiple tunnels can be opened per serial to work around the device's
+// per-tunnel realm limit. Tunnels persist for IdleTimeout after the last
+// stream disconnects, avoiding expensive P2P re-handshakes on reconnect.
 type SessionManager struct {
 	mu          sync.Mutex
-	sessions    map[string]*managedSession
+	sessions    map[string][]*managedSession // serial -> list of tunnels
 	inflight    map[string]*inflightConn
-	lastFailed  map[string]time.Time // per-serial cooldown after handshake failures
+	lastFailed  map[string]time.Time
 	IdleTimeout time.Duration
 }
 
@@ -108,7 +152,7 @@ type managedSession struct {
 // inflightConn tracks an in-progress handshake so multiple goroutines
 // don't race to create the same tunnel.
 type inflightConn struct {
-	done   chan struct{} // closed when handshake finishes
+	done   chan struct{}
 	client *Client
 	err    error
 }
@@ -116,20 +160,43 @@ type inflightConn struct {
 // NewSessionManager creates a new session manager
 func NewSessionManager() *SessionManager {
 	return &SessionManager{
-		sessions:    make(map[string]*managedSession),
+		sessions:    make(map[string][]*managedSession),
 		inflight:    make(map[string]*inflightConn),
 		lastFailed:  make(map[string]time.Time),
 		IdleTimeout: DefaultIdleTimeout,
 	}
 }
 
+// findAvailableSession returns an existing live session with capacity, or nil.
+// Must be called with m.mu held.
+func (m *SessionManager) findAvailableSession(serial string) *managedSession {
+	sessions := m.sessions[serial]
+	live := sessions[:0]
+	for _, s := range sessions {
+		if s.client.IsClosed() {
+			if s.idleTimer != nil {
+				s.idleTimer.Stop()
+			}
+			continue
+		}
+		live = append(live, s)
+	}
+	m.sessions[serial] = live
+
+	for _, s := range live {
+		if s.client.ActiveRealms() < MaxRealmsPerTunnel {
+			return s
+		}
+	}
+	return nil
+}
+
 // Acquire returns a cached or new client for the given config.
+// If all existing tunnels are at capacity, a new tunnel is created.
 // The caller must call Release when done.
-// The handshake runs outside the lock so other channels are not blocked.
 func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 	m.mu.Lock()
 
-	// Enforce cooldown after recent failures
 	if lastFail, ok := m.lastFailed[cfg.Serial]; ok {
 		remaining := HandshakeCooldown - time.Since(lastFail)
 		if remaining > 0 {
@@ -140,34 +207,24 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 		delete(m.lastFailed, cfg.Serial)
 	}
 
-	// Return existing live session
-	if s, ok := m.sessions[cfg.Serial]; ok {
-		if s.client.IsClosed() {
-			if s.idleTimer != nil {
-				s.idleTimer.Stop()
-			}
-			delete(m.sessions, cfg.Serial)
-		} else {
-			if s.idleTimer != nil {
-				s.idleTimer.Stop()
-				s.idleTimer = nil
-			}
-			s.refCount++
-			m.mu.Unlock()
-			return s.client, nil
+	if s := m.findAvailableSession(cfg.Serial); s != nil {
+		if s.idleTimer != nil {
+			s.idleTimer.Stop()
+			s.idleTimer = nil
 		}
+		s.refCount++
+		m.mu.Unlock()
+		return s.client, nil
 	}
 
-	// If another goroutine is already connecting, wait for it
 	if inf, ok := m.inflight[cfg.Serial]; ok {
 		m.mu.Unlock()
 		<-inf.done
 		if inf.err != nil {
 			return nil, inf.err
 		}
-		// Session was just created — grab it
 		m.mu.Lock()
-		if s, ok := m.sessions[cfg.Serial]; ok && !s.client.IsClosed() {
+		if s := m.findAvailableSession(cfg.Serial); s != nil {
 			s.refCount++
 			m.mu.Unlock()
 			return s.client, nil
@@ -176,12 +233,10 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 		return nil, ErrTimeout
 	}
 
-	// Register in-flight handshake and release lock
 	inf := &inflightConn{done: make(chan struct{})}
 	m.inflight[cfg.Serial] = inf
 	m.mu.Unlock()
 
-	// Run handshake WITHOUT holding the lock
 	client, err := ConnectWithConfig(cfg)
 	inf.client = client
 	inf.err = err
@@ -193,16 +248,23 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 			client:   client,
 			refCount: 1,
 		}
-		m.sessions[cfg.Serial] = ms
+		m.sessions[cfg.Serial] = append(m.sessions[cfg.Serial], ms)
 
 		serial := cfg.Serial
 		client.SetOnClose(func() {
 			m.mu.Lock()
 			defer m.mu.Unlock()
-			if cur, ok := m.sessions[serial]; ok && cur == ms {
-				if cur.idleTimer != nil {
-					cur.idleTimer.Stop()
+			sessions := m.sessions[serial]
+			for i, cur := range sessions {
+				if cur == ms {
+					if cur.idleTimer != nil {
+						cur.idleTimer.Stop()
+					}
+					m.sessions[serial] = append(sessions[:i], sessions[i+1:]...)
+					break
 				}
+			}
+			if len(m.sessions[serial]) == 0 {
 				delete(m.sessions, serial)
 			}
 		})
@@ -211,7 +273,6 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 	}
 	m.mu.Unlock()
 
-	// Wake all waiters
 	close(inf.done)
 
 	if err != nil {
@@ -220,59 +281,63 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 	return client, nil
 }
 
-// Invalidate force-closes and removes the session for the given serial.
-// Use this when the tunnel is confirmed broken (e.g. Dial/RTSP timeouts)
-// so the next Acquire creates a fresh tunnel instead of reusing the dead one.
-// A cooldown is applied to prevent hammering the device with reconnects.
+// Invalidate force-closes all tunnels for the given serial.
+// Use this when a tunnel is confirmed broken so the next Acquire
+// creates a fresh tunnel. A cooldown is applied.
 func (m *SessionManager) Invalidate(serial string) {
 	m.mu.Lock()
-	s, ok := m.sessions[serial]
-	if !ok {
-		m.mu.Unlock()
-		return
-	}
-	if s.idleTimer != nil {
-		s.idleTimer.Stop()
-	}
+	sessions := m.sessions[serial]
 	delete(m.sessions, serial)
 	m.lastFailed[serial] = time.Now()
 	m.mu.Unlock()
 
-	log.Warn().Str("serial", serial).Dur("cooldown", HandshakeCooldown).Msg("[dahua] session invalidated, cooldown applied")
-	s.client.Close()
-}
-
-// Release decrements the refcount for the given serial.
-// When refcount reaches zero, the tunnel is kept alive for IdleTimeout
-// before being closed. A new Acquire within that window reuses it.
-func (m *SessionManager) Release(serial string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	s, ok := m.sessions[serial]
-	if !ok {
+	if len(sessions) == 0 {
 		return
 	}
 
-	s.refCount--
-	if s.refCount <= 0 {
-		s.refCount = 0
+	log.Warn().Str("serial", serial).Int("tunnels", len(sessions)).Dur("cooldown", HandshakeCooldown).Msg("[dahua] session invalidated, cooldown applied")
+	for _, s := range sessions {
 		if s.idleTimer != nil {
 			s.idleTimer.Stop()
 		}
-		s.idleTimer = time.AfterFunc(m.IdleTimeout, func() {
-			m.mu.Lock()
-			s2, ok := m.sessions[serial]
-			if !ok || s2 != s || s2.refCount > 0 {
-				m.mu.Unlock()
-				return
-			}
-			delete(m.sessions, serial)
-			m.mu.Unlock()
+		s.client.Close()
+	}
+}
 
-			// Close outside the lock to avoid deadlock with OnClose callback
-			s2.client.Close()
-		})
+// Release decrements the refcount for the specific client under the given serial.
+// When refcount reaches zero, the tunnel is kept alive for IdleTimeout
+// before being closed.
+func (m *SessionManager) Release(serial string, client *Client) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, s := range m.sessions[serial] {
+		if s.client == client {
+			s.refCount--
+			if s.refCount <= 0 {
+				s.refCount = 0
+				if s.idleTimer != nil {
+					s.idleTimer.Stop()
+				}
+				s.idleTimer = time.AfterFunc(m.IdleTimeout, func() {
+					m.mu.Lock()
+					curSessions := m.sessions[serial]
+					for i, s2 := range curSessions {
+						if s2 == s && s2.refCount <= 0 {
+							m.sessions[serial] = append(curSessions[:i], curSessions[i+1:]...)
+							if len(m.sessions[serial]) == 0 {
+								delete(m.sessions, serial)
+							}
+							m.mu.Unlock()
+							s2.client.Close()
+							return
+						}
+					}
+					m.mu.Unlock()
+				})
+			}
+			return
+		}
 	}
 }
 
@@ -282,20 +347,21 @@ func (c *Client) Dial(port uint32) (net.Conn, error) {
 }
 
 // CloseAll closes all active sessions immediately.
-// Call this on process shutdown to notify devices of disconnection.
 func (m *SessionManager) CloseAll() {
 	m.mu.Lock()
-	sessions := make([]*managedSession, 0, len(m.sessions))
-	for serial, s := range m.sessions {
-		if s.idleTimer != nil {
-			s.idleTimer.Stop()
+	var all []*managedSession
+	for serial, sessions := range m.sessions {
+		for _, s := range sessions {
+			if s.idleTimer != nil {
+				s.idleTimer.Stop()
+			}
+			all = append(all, s)
 		}
 		delete(m.sessions, serial)
-		sessions = append(sessions, s)
 	}
 	m.mu.Unlock()
 
-	for _, s := range sessions {
+	for _, s := range all {
 		s.client.Close()
 	}
 }

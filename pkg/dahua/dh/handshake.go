@@ -511,9 +511,8 @@ func Handshake(opts HandshakeOptions) (*HandshakeResult, error) {
 
 	log.Debug().Hex("sign", sign).Msg("[dahua] got sign")
 
-	// Step 12: Try direct connection handshake with device
+	// Step 12: Try direct connection first, then fall back to relay
 	mainClient.Close()
-	p2pClient.Close()
 
 	const directRetries = 3
 	var session *ptcp.Session
@@ -525,18 +524,80 @@ func Handshake(opts HandshakeOptions) (*HandshakeResult, error) {
 		}
 		log.Warn().Err(err).Int("attempt", attempt).Int("max", directRetries).Msg("[dahua] direct connection attempt failed")
 	}
-	if err != nil {
-		deviceClient.Close()
-		return nil, fmt.Errorf("direct connection failed: %w", err)
+
+	if err == nil {
+		p2pClient.Close()
+		log.Info().Str("serial", opts.Serial).Msg("[dahua] direct P2P connection established")
+		return &HandshakeResult{
+			Client:     deviceClient,
+			Session:    session,
+			DeviceIP:   deviceParts[0],
+			DevicePort: devicePort,
+		}, nil
 	}
 
-	log.Info().Str("serial", opts.Serial).Msg("[dahua] direct P2P connection established")
+	// Direct connection failed -- fall back to relay mode via the agent
+	log.Warn().Str("serial", opts.Serial).Msg("[dahua] direct connection failed, falling back to relay via agent")
+	deviceClient.Close()
+
+	// The agentSession is already established (steps 10-11). The p2pClient
+	// is still connected to the agent. We send the auth sign (0x19) through
+	// the relay to prove legitimacy, then use the agent as a relay tunnel.
+	authCmd := []byte{0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	authCmd = append(authCmd, sign...)
+	authPacket := agentSession.Send(ptcp.NewCommandBody(authCmd))
+	if err := p2pClient.Send(authPacket.Serialize()); err != nil {
+		p2pClient.Close()
+		return nil, fmt.Errorf("relay auth send failed: %w", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		authResp, readErr := p2pClient.ReadRaw(opts.Timeout)
+		if readErr != nil {
+			continue
+		}
+		authRespPacket, parseErr := ptcp.ParsePacket(authResp)
+		if parseErr != nil {
+			continue
+		}
+		agentSession.Recv(authRespPacket)
+		if authRespPacket.Body.Type == ptcp.BodyTypeCommand &&
+			len(authRespPacket.Body.Command) > 0 &&
+			authRespPacket.Body.Command[0] == 0x1A {
+			break
+		}
+	}
+
+	ackCmd := []byte{0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	ackPacket := agentSession.Send(ptcp.NewCommandBody(ackCmd))
+	if err := p2pClient.Send(ackPacket.Serialize()); err != nil {
+		p2pClient.Close()
+		return nil, fmt.Errorf("relay ack send failed: %w", err)
+	}
+
+	if ackResp, readErr := p2pClient.ReadRaw(opts.Timeout); readErr == nil {
+		if ackRespPacket, parseErr := ptcp.ParsePacket(ackResp); parseErr == nil {
+			agentSession.Recv(ackRespPacket)
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		extra, readErr := p2pClient.ReadRaw(500 * time.Millisecond)
+		if readErr != nil {
+			break
+		}
+		if pkt, parseErr := ptcp.ParsePacket(extra); parseErr == nil {
+			agentSession.Recv(pkt)
+		}
+	}
+
+	log.Info().Str("serial", opts.Serial).Msg("[dahua] relay P2P connection established via agent")
 
 	return &HandshakeResult{
-		Client:     deviceClient,
-		Session:    session,
-		DeviceIP:   deviceParts[0],
-		DevicePort: devicePort,
+		Client:     p2pClient,
+		Session:    agentSession,
+		DeviceIP:   agentParts[0],
+		DevicePort: agentPort,
 	}, nil
 }
 

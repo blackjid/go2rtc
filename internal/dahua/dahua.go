@@ -2,7 +2,6 @@ package dahua
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,8 +17,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
+const streamLingerDuration = 30 * time.Second
+
 var log zerolog.Logger
 var sessions *dahua.SessionManager
+var lingerMu sync.Mutex
+var lingerTimers = map[string]*time.Timer{} // key: serial, delays Release on disconnect
 
 func Init() {
 	log = app.GetLogger("dahua")
@@ -30,10 +33,27 @@ func Init() {
 	api.HandleFunc("api/dahua", apiDahua)
 }
 
+// cancelLinger cancels a pending linger timer for the given serial, if any.
+func cancelLinger(serial string) {
+	lingerMu.Lock()
+	if t, ok := lingerTimers[serial]; ok {
+		t.Stop()
+		delete(lingerTimers, serial)
+	}
+	lingerMu.Unlock()
+}
+
 // Shutdown closes all active P2P sessions, notifying devices of disconnection.
 // Call this on process exit so devices can immediately free the P2P session
 // instead of waiting for heartbeat timeout.
 func Shutdown() {
+	lingerMu.Lock()
+	for serial, t := range lingerTimers {
+		t.Stop()
+		delete(lingerTimers, serial)
+	}
+	lingerMu.Unlock()
+
 	if sessions != nil {
 		log.Debug().Msg("[dahua] shutting down P2P sessions")
 		sessions.CloseAll()
@@ -95,6 +115,8 @@ func dahuaHandler(rawURL string) (core.Producer, error) {
 }
 
 func dahuaDial(serial, user, pass, channel, subtype string, p2pPort int) (core.Producer, error) {
+	cancelLinger(serial)
+
 	client, err := sessions.Acquire(dahua.Config{
 		Serial:   serial,
 		Username: user,
@@ -108,54 +130,71 @@ func dahuaDial(serial, user, pass, channel, subtype string, p2pPort int) (core.P
 	// Serialize RTSP negotiation: the device can't reliably handle
 	// concurrent OPTIONS/DESCRIBE/SETUP through the PTCP tunnel.
 	client.NegotiateMu.Lock()
+	client.WaitSettle()
 
-	listener, err := client.Listen("127.0.0.1:0", 554)
+	tunnelConn, err := client.Dial(554)
 	if err != nil {
 		client.NegotiateMu.Unlock()
 		sessions.Invalidate(serial)
-		return nil, fmt.Errorf("listen failed: %w", err)
+		return nil, fmt.Errorf("tunnel dial failed: %w", err)
 	}
 
-	localPort := listener.Addr().(*net.TCPAddr).Port
-	rtspURL := fmt.Sprintf("rtsp://%s:%s@127.0.0.1:%d/cam/realmonitor?channel=%s&subtype=%s",
-		user, pass, localPort, channel, subtype)
+	rtspURL := fmt.Sprintf("rtsp://%s:%s@tunnel/cam/realmonitor?channel=%s&subtype=%s",
+		user, pass, channel, subtype)
 
-	log.Debug().Str("rtsp_url", rtspURL).Msg("[dahua] starting RTSP via local bridge")
+	log.Debug().Str("rtsp_url", rtspURL).Msg("[dahua] starting RTSP via in-memory bridge")
 
-	conn := rtsp.NewClient(rtspURL)
+	conn := rtsp.NewClientWithConn(rtspURL, tunnelConn)
 	conn.UserAgent = app.UserAgent
+	conn.Timeout = 15
+	conn.CmdTimeout = 15 * time.Second
 
 	if err := conn.Dial(); err != nil {
-		listener.Close()
+		tunnelConn.Close()
 		client.NegotiateMu.Unlock()
 		if client.IsClosed() {
 			sessions.Invalidate(serial)
 		} else {
-			sessions.Release(serial)
+			sessions.Release(serial, client)
 		}
 		return nil, fmt.Errorf("RTSP dial failed: %w", err)
 	}
 
 	if err := conn.Describe(); err != nil {
-		listener.Close()
+		tunnelConn.Close()
 		client.NegotiateMu.Unlock()
 		if client.IsClosed() {
 			sessions.Invalidate(serial)
 		} else {
-			sessions.Release(serial)
+			sessions.Release(serial, client)
 		}
 		return nil, fmt.Errorf("RTSP describe failed: %w", err)
 	}
 
+	client.DoneNegotiate()
 	client.NegotiateMu.Unlock()
 
 	var cleanupOnce sync.Once
-	conn.OnClose = func() error {
+	doCleanup := func() {
 		cleanupOnce.Do(func() {
-			log.Debug().Str("serial", serial).Msg("[dahua] RTSP connection closed, cleaning up")
-			listener.Close()
-			sessions.Release(serial)
+			log.Debug().Str("serial", serial).Msg("[dahua] releasing P2P session")
+			tunnelConn.Close()
+			sessions.Release(serial, client)
 		})
+	}
+	conn.OnClose = func() error {
+		log.Debug().Str("serial", serial).Dur("linger", streamLingerDuration).Msg("[dahua] RTSP closed, starting linger")
+		lingerMu.Lock()
+		if t, ok := lingerTimers[serial]; ok {
+			t.Stop()
+		}
+		lingerTimers[serial] = time.AfterFunc(streamLingerDuration, func() {
+			lingerMu.Lock()
+			delete(lingerTimers, serial)
+			lingerMu.Unlock()
+			doCleanup()
+		})
+		lingerMu.Unlock()
 		return nil
 	}
 

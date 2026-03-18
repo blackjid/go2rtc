@@ -26,7 +26,7 @@ var (
 const (
 	maxConsecutiveReadErrors = 10
 	maxConsecutiveSendErrors = 5
-	maxMissedHeartbeats     = 6
+	maxMissedHeartbeats     = 24 // 2 minutes; RTSP read timeout provides faster detection
 )
 
 // Tunnel represents a P2P tunnel to a Dahua device
@@ -55,6 +55,9 @@ type Tunnel struct {
 	missedHeartbeatsMu  sync.Mutex
 	consecutiveReadErrs int
 	consecutiveSendErrs int
+
+	lastAckTime   time.Time
+	lastAckTimeMu sync.Mutex
 
 	// OnClose is called once when the tunnel closes (heartbeat timeout, errors, etc.)
 	OnClose func()
@@ -198,9 +201,26 @@ func (t *Tunnel) sendHeartbeat() {
 
 // ackHeartbeat resets the missed heartbeat counter (called when any packet is received).
 func (t *Tunnel) ackHeartbeat() {
+	now := time.Now()
 	t.missedHeartbeatsMu.Lock()
 	t.missedHeartbeats = 0
 	t.missedHeartbeatsMu.Unlock()
+	t.lastAckTimeMu.Lock()
+	t.lastAckTime = now
+	t.lastAckTimeMu.Unlock()
+}
+
+// IsResponsive returns true if the tunnel received a packet from the device
+// within the given duration. This indicates the device is not overloaded
+// and can handle new BIND/DESCRIBE requests.
+func (t *Tunnel) IsResponsive(within time.Duration) bool {
+	t.lastAckTimeMu.Lock()
+	last := t.lastAckTime
+	t.lastAckTimeMu.Unlock()
+	if last.IsZero() {
+		return false
+	}
+	return time.Since(last) < within
 }
 
 // reader reads packets from the device
@@ -314,6 +334,14 @@ func (t *Tunnel) sendACK() {
 		return
 	}
 	t.consecutiveSendErrs = 0
+}
+
+// ActiveRealms returns the number of currently active realms on this tunnel.
+func (t *Tunnel) ActiveRealms() int {
+	t.realmsMu.RLock()
+	n := len(t.realms)
+	t.realmsMu.RUnlock()
+	return n
 }
 
 // Dial creates a new realm/connection to the specified port on the device.

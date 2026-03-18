@@ -30,6 +30,7 @@ type Conn struct {
 	SessionName string
 	Timeout     int
 	Transport   string // custom transport support, ex. RTSP over WebSocket
+	CmdTimeout  time.Duration // per-connection override for RTSP command read/write deadlines
 
 	URL *url.URL
 
@@ -37,6 +38,7 @@ type Conn struct {
 
 	auth      *tcp.Auth
 	conn      net.Conn
+	injected  net.Conn // pre-established conn from NewClientWithConn; skips Dial's connect
 	keepalive int
 	mode      core.Mode
 	playOK    bool
@@ -318,6 +320,14 @@ func (c *Conn) handleRawPacket(channel byte, buf []byte) error {
 	return nil
 }
 
+// cmdTimeout returns the effective timeout for RTSP command read/write.
+func (c *Conn) cmdTimeout() time.Duration {
+	if c.CmdTimeout > 0 {
+		return c.CmdTimeout
+	}
+	return Timeout
+}
+
 func (c *Conn) WriteRequest(req *tcp.Request) error {
 	if req.Proto == "" {
 		req.Proto = ProtoRTSP
@@ -345,7 +355,7 @@ func (c *Conn) WriteRequest(req *tcp.Request) error {
 
 	c.Fire(req)
 
-	if err := c.conn.SetWriteDeadline(time.Now().Add(Timeout)); err != nil {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(c.cmdTimeout())); err != nil {
 		return err
 	}
 
@@ -353,7 +363,7 @@ func (c *Conn) WriteRequest(req *tcp.Request) error {
 }
 
 func (c *Conn) ReadRequest() (*tcp.Request, error) {
-	if err := c.conn.SetReadDeadline(time.Now().Add(Timeout)); err != nil {
+	if err := c.conn.SetReadDeadline(time.Now().Add(c.cmdTimeout())); err != nil {
 		return nil, err
 	}
 	return tcp.ReadRequest(c.reader)
@@ -394,7 +404,7 @@ func (c *Conn) WriteResponse(res *tcp.Response) error {
 
 	c.Fire(res)
 
-	if err := c.conn.SetWriteDeadline(time.Now().Add(Timeout)); err != nil {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(c.cmdTimeout())); err != nil {
 		return err
 	}
 
@@ -402,7 +412,7 @@ func (c *Conn) WriteResponse(res *tcp.Response) error {
 }
 
 func (c *Conn) ReadResponse() (*tcp.Response, error) {
-	if err := c.conn.SetReadDeadline(time.Now().Add(Timeout)); err != nil {
+	if err := c.conn.SetReadDeadline(time.Now().Add(c.cmdTimeout())); err != nil {
 		return nil, err
 	}
 	return tcp.ReadResponse(c.reader)

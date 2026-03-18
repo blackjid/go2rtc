@@ -30,6 +30,22 @@ func NewClient(uri string) *Conn {
 	}
 }
 
+// NewClientWithConn creates an RTSP client using a pre-established net.Conn,
+// bypassing Dial's TCP/WebSocket connection logic. The caller is responsible
+// for the lifecycle of the underlying conn. The uri is still parsed for
+// RTSP path, auth credentials, and request routing.
+func NewClientWithConn(uri string, conn net.Conn) *Conn {
+	c := &Conn{
+		Connection: core.Connection{
+			ID:         core.NewID(),
+			FormatName: "rtsp",
+		},
+		uri:      uri,
+		injected: conn,
+	}
+	return c
+}
+
 func (c *Conn) Dial() (err error) {
 	if c.URL, err = url.Parse(c.uri); err != nil {
 		return
@@ -37,27 +53,32 @@ func (c *Conn) Dial() (err error) {
 
 	var conn net.Conn
 
-	switch c.Transport {
-	case "", "tcp", "udp":
-		var timeout time.Duration
-		if c.Timeout != 0 {
-			timeout = time.Second * time.Duration(c.Timeout)
-		} else {
-			timeout = core.ConnDialTimeout
-		}
-		conn, err = tcp.Dial(c.URL, timeout)
+	if c.injected != nil {
+		conn = c.injected
+		c.Protocol = "rtsp+tcp"
+	} else {
+		switch c.Transport {
+		case "", "tcp", "udp":
+			var timeout time.Duration
+			if c.Timeout != 0 {
+				timeout = time.Second * time.Duration(c.Timeout)
+			} else {
+				timeout = core.ConnDialTimeout
+			}
+			conn, err = tcp.Dial(c.URL, timeout)
 
-		if c.Transport != "udp" {
-			c.Protocol = "rtsp+tcp"
-		} else {
-			c.Protocol = "rtsp+udp"
+			if c.Transport != "udp" {
+				c.Protocol = "rtsp+tcp"
+			} else {
+				c.Protocol = "rtsp+udp"
+			}
+		default:
+			conn, err = websocket.Dial(c.Transport)
+			c.Protocol = "ws"
 		}
-	default:
-		conn, err = websocket.Dial(c.Transport)
-		c.Protocol = "ws"
-	}
-	if err != nil {
-		return
+		if err != nil {
+			return
+		}
 	}
 
 	// remove UserInfo from URL
