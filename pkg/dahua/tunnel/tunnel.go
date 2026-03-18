@@ -250,6 +250,11 @@ func (t *Tunnel) reader() {
 			t.sendACK()
 			continue
 
+		case ptcp.BodyTypeSync:
+			syncPkt := t.session.Send(ptcp.NewSyncBody())
+			t.client.Send(syncPkt.Serialize())
+			continue
+
 		case ptcp.BodyTypeStatus:
 			realm := packet.Body.Realm
 			status := packet.Body.Status
