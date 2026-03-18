@@ -68,55 +68,38 @@ func dahuaHandler(rawURL string) (core.Producer, error) {
 		subtype = "0"
 	}
 
-	relayMode := query.Get("relay") == "true"
-
 	var p2pPort int
 	if portStr := query.Get("p2p_port"); portStr != "" {
 		p2pPort, _ = strconv.Atoi(portStr)
 	}
 
-	log.Info().Str("serial", serial).Str("channel", channel).Str("subtype", subtype).Bool("relay", relayMode).Int("p2p_port", p2pPort).Msg("[dahua] connecting via P2P")
+	log.Info().Str("serial", serial).Str("channel", channel).Str("subtype", subtype).Int("p2p_port", p2pPort).Msg("[dahua] connecting via P2P")
 
-	type attempt struct {
-		relay   bool
-		backoff time.Duration
-	}
-
-	attempts := []attempt{
-		{relay: relayMode, backoff: dahua.HandshakeCooldown + 5*time.Second},
-		{relay: relayMode, backoff: dahua.HandshakeCooldown + 5*time.Second},
-	}
-	if !relayMode {
-		// After direct mode fails twice, fall back to relay
-		attempts = append(attempts,
-			attempt{relay: true, backoff: dahua.HandshakeCooldown + 5*time.Second},
-			attempt{relay: true},
-		)
-	}
+	const maxAttempts = 4
+	backoff := dahua.HandshakeCooldown + 5*time.Second
 
 	var lastErr error
-	for i, a := range attempts {
-		conn, err := dahuaDial(serial, user, pass, channel, subtype, a.relay, p2pPort)
+	for i := 0; i < maxAttempts; i++ {
+		conn, err := dahuaDial(serial, user, pass, channel, subtype, p2pPort)
 		if err == nil {
 			return conn, nil
 		}
 		lastErr = err
-		if i < len(attempts)-1 {
-			log.Warn().Err(err).Int("attempt", i+1).Int("max", len(attempts)).Bool("relay", a.relay).Dur("backoff", a.backoff).Str("serial", serial).Msg("[dahua] connection failed, retrying")
-			time.Sleep(a.backoff)
+		if i < maxAttempts-1 {
+			log.Warn().Err(err).Int("attempt", i+1).Int("max", maxAttempts).Dur("backoff", backoff).Str("serial", serial).Msg("[dahua] connection failed, retrying")
+			time.Sleep(backoff)
 		}
 	}
 	log.Error().Err(lastErr).Str("serial", serial).Msg("[dahua] all connection attempts failed")
 	return nil, lastErr
 }
 
-func dahuaDial(serial, user, pass, channel, subtype string, relayMode bool, p2pPort int) (core.Producer, error) {
+func dahuaDial(serial, user, pass, channel, subtype string, p2pPort int) (core.Producer, error) {
 	client, err := sessions.Acquire(dahua.Config{
-		Serial:    serial,
-		Username:  user,
-		Password:  pass,
-		RelayMode: relayMode,
-		P2PPort:   p2pPort,
+		Serial:   serial,
+		Username: user,
+		Password: pass,
+		P2PPort:  p2pPort,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("P2P handshake failed: %w", err)

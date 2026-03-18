@@ -18,14 +18,12 @@ type HandshakeResult struct {
 	Session    *ptcp.Session
 	DeviceIP   string
 	DevicePort int
-	RelayMode  bool
 }
 
 // HandshakeOptions contains options for the P2P handshake
 type HandshakeOptions struct {
-	Serial    string
-	RelayMode bool
-	Timeout   time.Duration
+	Serial  string
+	Timeout time.Duration
 
 	// Device authentication credentials (required for devices with per-device randsalt)
 	DeviceUsername string
@@ -467,23 +465,9 @@ func Handshake(opts HandshakeOptions) (*HandshakeResult, error) {
 	}
 	agentSession.Recv(syncRespPacket)
 
-	log.Debug().Bool("relay_mode", opts.RelayMode).Msg("[dahua] PTCP session established with agent")
+	log.Debug().Msg("[dahua] PTCP session established with agent")
 
-	// If relay mode, we're done with agent connection
-	if opts.RelayMode {
-		log.Info().Str("serial", opts.Serial).Msg("[dahua] using relay mode")
-		mainClient.Close()
-		deviceClient.Close()
-		return &HandshakeResult{
-			Client:     p2pClient,
-			Session:    agentSession,
-			DeviceIP:   agentParts[0],
-			DevicePort: agentPort,
-			RelayMode:  true,
-		}, nil
-	}
-
-	// Step 10: Request sign from agent (command 0x17)
+	// Step 11: Request sign from agent (command 0x17)
 	log.Debug().Msg("[dahua] step 11: requesting sign from agent")
 	signRequestCmd := []byte{0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 	signReqPacket := agentSession.Send(ptcp.NewCommandBody(signRequestCmd))
@@ -495,7 +479,6 @@ func Handshake(opts HandshakeOptions) (*HandshakeResult, error) {
 		return nil, fmt.Errorf("failed to send sign request: %w", err)
 	}
 
-	// Read sign response, resending the request on each timeout
 	var sign []byte
 	for i := 0; i < 5; i++ {
 		signResp, err := p2pClient.ReadRaw(opts.Timeout)
@@ -520,24 +503,17 @@ func Handshake(opts HandshakeOptions) (*HandshakeResult, error) {
 	}
 
 	if sign == nil {
-		// Fall back to relay mode if we couldn't get sign
-		log.Warn().Msg("[dahua] could not get sign from agent, falling back to relay mode")
 		mainClient.Close()
+		p2pClient.Close()
 		deviceClient.Close()
-		return &HandshakeResult{
-			Client:     p2pClient,
-			Session:    agentSession,
-			DeviceIP:   agentParts[0],
-			DevicePort: agentPort,
-			RelayMode:  true,
-		}, nil
+		return nil, fmt.Errorf("could not get sign from agent")
 	}
 
 	log.Debug().Hex("sign", sign).Msg("[dahua] got sign")
 
-	// Step 11: Try direct connection handshake with device
-	// Keep relay connection alive so we can fall back if direct fails
+	// Step 12: Try direct connection handshake with device
 	mainClient.Close()
+	p2pClient.Close()
 
 	const directRetries = 3
 	var session *ptcp.Session
@@ -550,27 +526,17 @@ func Handshake(opts HandshakeOptions) (*HandshakeResult, error) {
 		log.Warn().Err(err).Int("attempt", attempt).Int("max", directRetries).Msg("[dahua] direct connection attempt failed")
 	}
 	if err != nil {
-		log.Warn().Err(err).Msg("[dahua] all direct connection attempts failed, falling back to relay mode")
 		deviceClient.Close()
-		return &HandshakeResult{
-			Client:     p2pClient,
-			Session:    agentSession,
-			DeviceIP:   agentParts[0],
-			DevicePort: agentPort,
-			RelayMode:  true,
-		}, nil
+		return nil, fmt.Errorf("direct connection failed: %w", err)
 	}
 
-	// Direct connection succeeded, close relay
 	log.Info().Str("serial", opts.Serial).Msg("[dahua] direct P2P connection established")
-	p2pClient.Close()
 
 	return &HandshakeResult{
 		Client:     deviceClient,
 		Session:    session,
 		DeviceIP:   deviceParts[0],
 		DevicePort: devicePort,
-		RelayMode:  false,
 	}, nil
 }
 

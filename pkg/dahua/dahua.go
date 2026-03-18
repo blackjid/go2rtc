@@ -27,12 +27,11 @@ func (c *Client) SetOnClose(fn func()) {
 
 // Config contains configuration options for the P2P client
 type Config struct {
-	Serial    string
-	Username  string
-	Password  string
-	RelayMode bool
-	Timeout   time.Duration
-	P2PPort   int // Fixed local UDP port for P2P (0 = random)
+	Serial   string
+	Username string
+	Password string
+	Timeout  time.Duration
+	P2PPort  int // Fixed local UDP port for P2P (0 = random)
 }
 
 // ConnectWithConfig creates a new P2P connection with custom configuration
@@ -42,12 +41,11 @@ func ConnectWithConfig(cfg Config) (*Client, error) {
 	}
 
 	t, err := tunnel.New(tunnel.Config{
-		Serial:    cfg.Serial,
-		Username:  cfg.Username,
-		Password:  cfg.Password,
-		RelayMode: cfg.RelayMode,
-		Timeout:   cfg.Timeout,
-		P2PPort:   cfg.P2PPort,
+		Serial:   cfg.Serial,
+		Username: cfg.Username,
+		Password: cfg.Password,
+		Timeout:  cfg.Timeout,
+		P2PPort:  cfg.P2PPort,
 	})
 	if err != nil {
 		return nil, err

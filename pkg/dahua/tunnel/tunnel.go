@@ -66,7 +66,6 @@ type Config struct {
 	Username   string
 	Password   string
 	RemotePort uint32 // Default: 554 for RTSP
-	RelayMode  bool
 	Timeout    time.Duration
 	P2PPort    int // Fixed local UDP port for P2P (0 = random)
 }
@@ -82,7 +81,6 @@ func New(cfg Config) (*Tunnel, error) {
 
 	result, err := dh.Handshake(dh.HandshakeOptions{
 		Serial:         cfg.Serial,
-		RelayMode:      cfg.RelayMode,
 		Timeout:        cfg.Timeout,
 		DeviceUsername:  cfg.Username,
 		DevicePassword: cfg.Password,
