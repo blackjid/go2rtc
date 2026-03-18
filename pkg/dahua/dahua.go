@@ -15,8 +15,9 @@ import (
 
 // Client represents a P2P connection to a Dahua device
 type Client struct {
-	tunnel *tunnel.Tunnel
-	config Config
+	tunnel      *tunnel.Tunnel
+	config      Config
+	NegotiateMu sync.Mutex // serializes RTSP negotiation; device can't handle concurrent SETUP
 }
 
 // SetOnClose registers a callback invoked when the underlying tunnel closes

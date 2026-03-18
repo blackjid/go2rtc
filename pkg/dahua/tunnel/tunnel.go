@@ -26,7 +26,7 @@ var (
 const (
 	maxConsecutiveReadErrors = 10
 	maxConsecutiveSendErrors = 5
-	maxMissedHeartbeats     = 3
+	maxMissedHeartbeats     = 6
 )
 
 // Tunnel represents a P2P tunnel to a Dahua device

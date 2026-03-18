@@ -105,8 +105,13 @@ func dahuaDial(serial, user, pass, channel, subtype string, p2pPort int) (core.P
 		return nil, fmt.Errorf("P2P handshake failed: %w", err)
 	}
 
+	// Serialize RTSP negotiation: the device can't reliably handle
+	// concurrent OPTIONS/DESCRIBE/SETUP through the PTCP tunnel.
+	client.NegotiateMu.Lock()
+
 	listener, err := client.Listen("127.0.0.1:0", 554)
 	if err != nil {
+		client.NegotiateMu.Unlock()
 		sessions.Invalidate(serial)
 		return nil, fmt.Errorf("listen failed: %w", err)
 	}
@@ -122,15 +127,27 @@ func dahuaDial(serial, user, pass, channel, subtype string, p2pPort int) (core.P
 
 	if err := conn.Dial(); err != nil {
 		listener.Close()
-		sessions.Invalidate(serial)
+		client.NegotiateMu.Unlock()
+		if client.IsClosed() {
+			sessions.Invalidate(serial)
+		} else {
+			sessions.Release(serial)
+		}
 		return nil, fmt.Errorf("RTSP dial failed: %w", err)
 	}
 
 	if err := conn.Describe(); err != nil {
 		listener.Close()
-		sessions.Invalidate(serial)
+		client.NegotiateMu.Unlock()
+		if client.IsClosed() {
+			sessions.Invalidate(serial)
+		} else {
+			sessions.Release(serial)
+		}
 		return nil, fmt.Errorf("RTSP describe failed: %w", err)
 	}
+
+	client.NegotiateMu.Unlock()
 
 	var cleanupOnce sync.Once
 	conn.OnClose = func() error {
