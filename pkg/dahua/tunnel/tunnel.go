@@ -96,7 +96,7 @@ func New(cfg Config) (*Tunnel, error) {
 		session:     result.Session,
 		done:        make(chan struct{}),
 		realms:      make(map[uint32]chan []byte),
-		nextRealmID: 1,
+		nextRealmID: 0,
 		connCh:      make(map[uint32]chan bool),
 	}
 
@@ -238,6 +238,7 @@ func (t *Tunnel) reader() {
 
 		packet, err := ptcp.ParsePacket(data)
 		if err != nil {
+			log.Debug().Err(err).Int("raw_len", len(data)).Msg("[dahua] reader: unparseable packet")
 			continue
 		}
 
@@ -245,17 +246,22 @@ func (t *Tunnel) reader() {
 
 		switch packet.Body.Type {
 		case ptcp.BodyTypeEmpty:
+			t.sendACK()
 			continue
 
 		case ptcp.BodyTypeStatus:
 			realm := packet.Body.Realm
 			status := packet.Body.Status
 
+			log.Debug().Uint32("realm", realm).Str("status", status).Msg("[dahua] PTCP status")
+
 			if status == ptcp.StatusConnect {
 				t.connChMu.Lock()
 				if ch, ok := t.connCh[realm]; ok {
 					ch <- true
 					delete(t.connCh, realm)
+				} else {
+					log.Warn().Uint32("realm", realm).Msg("[dahua] reader: StatusConnect for unknown realm")
 				}
 				t.connChMu.Unlock()
 			}
@@ -275,12 +281,17 @@ func (t *Tunnel) reader() {
 				case <-time.After(100 * time.Millisecond):
 					log.Warn().Uint32("realm", realm).Msg("[dahua] payload channel full, dropping packet")
 				}
+			} else {
+				log.Warn().Uint32("realm", realm).Int("data_len", len(packet.Body.Data)).Msg("[dahua] reader: payload for unknown realm")
 			}
 
 			t.sendACK()
 
 		case ptcp.BodyTypeHeartbeat:
 			t.sendACK()
+
+		default:
+			log.Debug().Int("body_type", int(packet.Body.Type)).Msg("[dahua] reader: unhandled body type")
 		}
 	}
 }
@@ -338,7 +349,15 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 
 	connected := false
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		bindPacket := t.session.Send(ptcp.NewBindBody(realmID, port))
+		bindBody := ptcp.NewBindBody(realmID, port)
+		bindPacket := t.session.Send(bindBody)
+
+		log.Debug().
+			Int("attempt", attempt+1).
+			Uint32("realm", realmID).
+			Uint32("port", port).
+			Msg("[dahua] sending BIND")
+
 		if err := t.client.Send(bindPacket.Serialize()); err != nil {
 			cleanup()
 			return nil, err
@@ -351,7 +370,7 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 			cleanup()
 			return nil, ErrTunnelClosed
 		case <-time.After(retryTimeout):
-			log.Debug().Int("attempt", attempt+1).Uint32("port", port).Msg("[dahua] bind retry")
+			log.Debug().Int("attempt", attempt+1).Uint32("port", port).Uint32("realm", realmID).Msg("[dahua] bind retry (no StatusConnect received)")
 			continue
 		}
 
@@ -362,7 +381,7 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 
 	if !connected {
 		cleanup()
-		log.Debug().Uint32("port", port).Uint32("realm", realmID).Bool("closed", t.IsClosed()).Msg("[dahua] bind request timed out after all retries")
+		log.Warn().Uint32("port", port).Uint32("realm", realmID).Bool("closed", t.IsClosed()).Msg("[dahua] bind request timed out after all retries")
 		return nil, ErrDialTimeout
 	}
 

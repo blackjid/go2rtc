@@ -43,8 +43,9 @@ func (s *Session) Send(body *Body) *Packet {
 	s.sent += uint32(body.Len())
 	s.id++
 
-	// Increment count for data-bearing packets only (not control packets)
-	if body.Type != BodyTypeSync && body.Type != BodyTypeEmpty && body.Type != BodyTypeHeartbeat {
+	// Increment count for all non-sync packets so each gets a unique PID.
+	// The device uses PID for deduplication and will discard duplicate PIDs.
+	if body.Type != BodyTypeSync {
 		s.count++
 	}
 
