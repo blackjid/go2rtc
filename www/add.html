@@ -162,6 +162,33 @@
     </script>
 
 
+    <button id="dahua">Dahua/KBVision (P2P)</button>
+    <div>
+        <form id="dahua-form">
+            <input type="text" name="serial" placeholder="device serial (e.g. 9H0D892PAZ43131)" required size="30">
+            <input type="text" name="username" placeholder="username" required>
+            <input type="password" name="password" placeholder="password" required>
+            <input type="number" name="channels" placeholder="channels (default: 1)" min="1" max="64" size="5">
+            <button type="submit">discover</button>
+        </form>
+        <table id="dahua-table"></table>
+    </div>
+    <script>
+        document.getElementById('dahua').addEventListener('click', async ev => {
+            ev.target.nextElementSibling.style.display = 'grid';
+        });
+
+        document.getElementById('dahua-form').addEventListener('submit', async ev => {
+            ev.preventDefault();
+
+            const query = new URLSearchParams(new FormData(ev.target));
+            const url = new URL('api/dahua?' + query.toString(), location.href);
+
+            await getSources('dahua-table', url.toString());
+        });
+    </script>
+
+
     <button id="dvrip">DVRIP</button>
     <div>
         <table id="dvrip-table"></table>
