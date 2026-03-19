@@ -134,8 +134,13 @@ func dahuaDial(serial, user, pass, channel, subtype string, p2pPort int) (core.P
 
 	tunnelConn, err := client.Dial(554)
 	if err != nil {
+		client.DoneNegotiate()
 		client.NegotiateMu.Unlock()
-		sessions.Invalidate(serial)
+		if client.IsClosed() {
+			sessions.Invalidate(serial)
+		} else {
+			sessions.Release(serial, client)
+		}
 		return nil, fmt.Errorf("tunnel dial failed: %w", err)
 	}
 

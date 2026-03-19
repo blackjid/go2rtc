@@ -13,13 +13,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// NegotiateSettle is the maximum settle time between consecutive RTSP
-// negotiations. Adaptive settling will reduce this if the device is responsive.
-const NegotiateSettle = 5 * time.Second
+// NegotiateSettle is the settle time between consecutive RTSP negotiations.
+// Adaptive settling will reduce this if the device is responsive.
+const NegotiateSettle = 500 * time.Millisecond
 
 // minNegotiateSettle is the minimum settle time used when the device is
 // actively responding to heartbeats (indicating low load).
-const minNegotiateSettle = 1 * time.Second
+const minNegotiateSettle = 250 * time.Millisecond
 
 // Client represents a P2P connection to a Dahua device
 type Client struct {
@@ -127,9 +127,8 @@ const DefaultIdleTimeout = 5 * time.Minute
 const HandshakeCooldown = 30 * time.Second
 
 // MaxRealmsPerTunnel is the maximum number of realms to multiplex on a single
-// P2P tunnel before opening a second tunnel. Dahua firmware becomes unstable
-// beyond 3-5 concurrent realms; 4 is a safe default.
-const MaxRealmsPerTunnel = 4
+// P2P tunnel. The DMSS app handles 17 realms on one tunnel, so 16 is safe.
+const MaxRealmsPerTunnel = 16
 
 // SessionManager manages shared P2P tunnels per serial with refcounting.
 // Multiple tunnels can be opened per serial to work around the device's

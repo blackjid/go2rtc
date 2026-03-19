@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -37,10 +38,10 @@ type Tunnel struct {
 	closed  bool
 	done    chan struct{} // closed on shutdown; used by reader and heartbeat
 
-	// Realms map connection IDs to their data channels
-	realms      map[uint32]chan []byte
-	realmsMu    sync.RWMutex
-	nextRealmID uint32
+	// Realms map connection IDs to their data channels.
+	// Realm IDs are random uint32 values, matching DMSS app behavior.
+	realms   map[uint32]chan []byte
+	realmsMu sync.RWMutex
 
 	// For connection establishment
 	connCh   map[uint32]chan bool
@@ -58,6 +59,11 @@ type Tunnel struct {
 
 	lastAckTime   time.Time
 	lastAckTimeMu sync.Mutex
+
+	// ACK coalescing: batch multiple received packets into a single ACK
+	ackPending bool
+	ackTimer   *time.Timer
+	ackMu      sync.Mutex
 
 	// OnClose is called once when the tunnel closes (heartbeat timeout, errors, etc.)
 	OnClose func()
@@ -94,12 +100,11 @@ func New(cfg Config) (*Tunnel, error) {
 	}
 
 	t := &Tunnel{
-		client:      result.Client,
-		session:     result.Session,
-		done:        make(chan struct{}),
-		realms:      make(map[uint32]chan []byte),
-		nextRealmID: 0,
-		connCh:      make(map[uint32]chan bool),
+		client:  result.Client,
+		session: result.Session,
+		done:    make(chan struct{}),
+		realms:  make(map[uint32]chan []byte),
+		connCh:  make(map[uint32]chan bool),
 	}
 
 	// Start reader goroutine
@@ -125,6 +130,12 @@ func (t *Tunnel) Close() error {
 	if t.heartbeatTicker != nil {
 		t.heartbeatTicker.Stop()
 	}
+
+	t.ackMu.Lock()
+	if t.ackTimer != nil {
+		t.ackTimer.Stop()
+	}
+	t.ackMu.Unlock()
 
 	// Collect active realm IDs and send DISC for each before closing the socket
 	t.realmsMu.Lock()
@@ -265,7 +276,7 @@ func (t *Tunnel) reader() {
 
 		switch packet.Body.Type {
 		case ptcp.BodyTypeEmpty:
-			t.sendACK()
+			// Don't ACK empty packets; they are ACKs themselves.
 			continue
 
 		case ptcp.BodyTypeSync:
@@ -290,7 +301,7 @@ func (t *Tunnel) reader() {
 				t.connChMu.Unlock()
 			}
 
-			t.sendACK()
+			t.scheduleACK()
 
 		case ptcp.BodyTypePayload:
 			realm := packet.Body.Realm
@@ -302,17 +313,17 @@ func (t *Tunnel) reader() {
 				select {
 				case ch <- packet.Body.Data:
 				case <-t.done:
-				case <-time.After(100 * time.Millisecond):
+				case <-time.After(500 * time.Millisecond):
 					log.Warn().Uint32("realm", realm).Msg("[dahua] payload channel full, dropping packet")
 				}
 			} else {
 				log.Warn().Uint32("realm", realm).Int("data_len", len(packet.Body.Data)).Msg("[dahua] reader: payload for unknown realm")
 			}
 
-			t.sendACK()
+			t.scheduleACK()
 
 		case ptcp.BodyTypeHeartbeat:
-			t.sendACK()
+			t.scheduleACK()
 
 		default:
 			log.Debug().Int("body_type", int(packet.Body.Type)).Msg("[dahua] reader: unhandled body type")
@@ -320,8 +331,31 @@ func (t *Tunnel) reader() {
 	}
 }
 
-// sendACK sends an empty ACK packet and tracks consecutive failures.
-func (t *Tunnel) sendACK() {
+// ackCoalesceWindow is how long to wait before sending a batched ACK.
+// The DMSS app averages ~2.7 payloads per ACK; 20ms coalesces effectively
+// while staying responsive.
+const ackCoalesceWindow = 20 * time.Millisecond
+
+// scheduleACK marks that an ACK is needed and starts a coalescing timer.
+// Multiple received packets within the window produce a single ACK,
+// reducing traffic to the device.
+func (t *Tunnel) scheduleACK() {
+	t.ackMu.Lock()
+	defer t.ackMu.Unlock()
+
+	if t.ackPending {
+		return
+	}
+	t.ackPending = true
+	t.ackTimer = time.AfterFunc(ackCoalesceWindow, t.flushACK)
+}
+
+// flushACK sends the coalesced ACK.
+func (t *Tunnel) flushACK() {
+	t.ackMu.Lock()
+	t.ackPending = false
+	t.ackMu.Unlock()
+
 	ackPacket := t.session.Send(ptcp.NewEmptyBody())
 	if err := t.client.Send(ackPacket.Serialize()); err != nil {
 		t.consecutiveSendErrs++
@@ -334,6 +368,19 @@ func (t *Tunnel) sendACK() {
 		return
 	}
 	t.consecutiveSendErrs = 0
+}
+
+// randomRealmID generates a random uint32 realm ID that doesn't collide with
+// any existing realm. The DMSS app uses large, non-sequential realm IDs.
+func (t *Tunnel) randomRealmID() uint32 {
+	t.realmsMu.RLock()
+	defer t.realmsMu.RUnlock()
+	for {
+		id := rand.Uint32()
+		if _, exists := t.realms[id]; !exists {
+			return id
+		}
+	}
 }
 
 // ActiveRealms returns the number of currently active realms on this tunnel.
@@ -363,33 +410,31 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 		return nil, ErrTunnelClosed
 	}
 
-	dataCh := make(chan []byte, 4096)
-	connCh := make(chan bool, 1)
-
-	t.realmsMu.Lock()
-	realmID := t.nextRealmID
-	t.nextRealmID++
-	t.realms[realmID] = dataCh
-	t.realmsMu.Unlock()
-
-	t.connChMu.Lock()
-	t.connCh[realmID] = connCh
-	t.connChMu.Unlock()
-
-	cleanup := func() {
-		t.realmsMu.Lock()
-		delete(t.realms, realmID)
-		t.realmsMu.Unlock()
-		t.connChMu.Lock()
-		delete(t.connCh, realmID)
-		t.connChMu.Unlock()
-	}
-
 	const maxRetries = 3
 	const retryTimeout = 5 * time.Second
 
-	connected := false
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		realmID := t.randomRealmID()
+		dataCh := make(chan []byte, 4096)
+		connCh := make(chan bool, 1)
+
+		t.realmsMu.Lock()
+		t.realms[realmID] = dataCh
+		t.realmsMu.Unlock()
+
+		t.connChMu.Lock()
+		t.connCh[realmID] = connCh
+		t.connChMu.Unlock()
+
+		cleanup := func() {
+			t.realmsMu.Lock()
+			delete(t.realms, realmID)
+			t.realmsMu.Unlock()
+			t.connChMu.Lock()
+			delete(t.connCh, realmID)
+			t.connChMu.Unlock()
+		}
+
 		bindBody := ptcp.NewBindBody(realmID, port)
 		bindPacket := t.session.Send(bindBody)
 
@@ -406,32 +451,24 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 
 		select {
 		case <-connCh:
-			connected = true
+			return &Conn{
+				tunnel:  t,
+				realmID: realmID,
+				dataCh:  dataCh,
+				closeCh: make(chan struct{}),
+			}, nil
 		case <-t.done:
 			cleanup()
 			return nil, ErrTunnelClosed
 		case <-time.After(retryTimeout):
-			log.Debug().Int("attempt", attempt+1).Uint32("port", port).Uint32("realm", realmID).Msg("[dahua] bind retry (no StatusConnect received)")
+			cleanup()
+			log.Debug().Int("attempt", attempt+1).Uint32("port", port).Uint32("realm", realmID).Msg("[dahua] bind retry with fresh realm ID")
 			continue
 		}
-
-		if connected {
-			break
-		}
 	}
 
-	if !connected {
-		cleanup()
-		log.Warn().Uint32("port", port).Uint32("realm", realmID).Bool("closed", t.IsClosed()).Msg("[dahua] bind request timed out after all retries")
-		return nil, ErrDialTimeout
-	}
-
-	return &Conn{
-		tunnel:  t,
-		realmID: realmID,
-		dataCh:  dataCh,
-		closeCh: make(chan struct{}),
-	}, nil
+	log.Warn().Uint32("port", port).Bool("closed", t.IsClosed()).Msg("[dahua] bind request timed out after all retries")
+	return nil, ErrDialTimeout
 }
 
 // Conn represents a connection within a tunnel
