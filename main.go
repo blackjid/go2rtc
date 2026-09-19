@@ -9,6 +9,7 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/AlexxIT/go2rtc/internal/bubble"
 	"github.com/AlexxIT/go2rtc/internal/debug"
+	"github.com/AlexxIT/go2rtc/internal/dahua"
 	"github.com/AlexxIT/go2rtc/internal/doorbird"
 	"github.com/AlexxIT/go2rtc/internal/dvrip"
 	"github.com/AlexxIT/go2rtc/internal/echo"
@@ -91,6 +92,7 @@ func main() {
 		// Other sources
 		{"bubble", bubble.Init},
 		{"doorbird", doorbird.Init},
+		{"dahua", dahua.Init},
 		{"dvrip", dvrip.Init},
 		{"eseecloud", eseecloud.Init},
 		{"flussonic", flussonic.Init},
@@ -122,4 +124,6 @@ func main() {
 	}
 
 	shell.RunUntilSignal()
+
+	dahua.Shutdown()
 }
