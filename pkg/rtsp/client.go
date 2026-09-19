@@ -30,6 +30,16 @@ func NewClient(uri string) *Conn {
 	}
 }
 
+// NewClientWithDialer creates an RTSP client that obtains its transport from
+// dial instead of Dial's TCP/WebSocket logic. dial is called on every Dial,
+// so Reconnect gets a fresh connection rather than reusing a dead one. The
+// uri is still parsed for RTSP path, auth credentials, and request routing.
+func NewClientWithDialer(uri string, dial func() (net.Conn, error)) *Conn {
+	c := NewClient(uri)
+	c.dialConn = dial
+	return c
+}
+
 func (c *Conn) Dial() (err error) {
 	if c.URL, err = url.Parse(c.uri); err != nil {
 		return
@@ -37,27 +47,34 @@ func (c *Conn) Dial() (err error) {
 
 	var conn net.Conn
 
-	switch c.Transport {
-	case "", "tcp", "udp":
-		var timeout time.Duration
-		if c.Timeout != 0 {
-			timeout = time.Second * time.Duration(c.Timeout)
-		} else {
-			timeout = core.ConnDialTimeout
+	if c.dialConn != nil {
+		if conn, err = c.dialConn(); err != nil {
+			return
 		}
-		conn, err = tcp.Dial(c.URL, timeout)
+		c.Protocol = "rtsp+tcp"
+	} else {
+		switch c.Transport {
+		case "", "tcp", "udp":
+			var timeout time.Duration
+			if c.Timeout != 0 {
+				timeout = time.Second * time.Duration(c.Timeout)
+			} else {
+				timeout = core.ConnDialTimeout
+			}
+			conn, err = tcp.Dial(c.URL, timeout)
 
-		if c.Transport != "udp" {
-			c.Protocol = "rtsp+tcp"
-		} else {
-			c.Protocol = "rtsp+udp"
+			if c.Transport != "udp" {
+				c.Protocol = "rtsp+tcp"
+			} else {
+				c.Protocol = "rtsp+udp"
+			}
+		default:
+			conn, err = websocket.Dial(c.Transport)
+			c.Protocol = "ws"
 		}
-	default:
-		conn, err = websocket.Dial(c.Transport)
-		c.Protocol = "ws"
-	}
-	if err != nil {
-		return
+		if err != nil {
+			return
+		}
 	}
 
 	// remove UserInfo from URL
