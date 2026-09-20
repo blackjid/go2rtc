@@ -15,8 +15,8 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/pkg/core"
-	"github.com/AlexxIT/go2rtc/pkg/dahua"
 	"github.com/AlexxIT/go2rtc/pkg/rtsp"
+	"github.com/blackjid/dahua-p2p"
 	"github.com/rs/zerolog"
 )
 
@@ -30,19 +30,6 @@ const negotiateLockTimeout = 90 * time.Second
 // package default (5s) is tuned for LAN cameras and is too tight for an NVR
 // answering DESCRIBE over a WAN UDP hole punch.
 const rtspCmdTimeout = 15 * time.Second
-
-// deadTunnelSilence is how long the device must have sent us nothing before a
-// BIND timeout is taken as proof the tunnel is dead rather than just busy.
-// Heartbeats go out every 5s, so two missed rounds is unambiguous.
-const deadTunnelSilence = 12 * time.Second
-
-// maxBindFailures is how many consecutive BIND timeouts a still-responsive
-// tunnel is allowed before we rebuild it anyway. The device can acknowledge
-// every byte we send while refusing to grant a single new realm, and in that
-// state the tunnel never recovers on its own — only a fresh handshake clears
-// it. One failure is tolerated so a single unlucky stream cannot tear down
-// the realms its siblings are using.
-const maxBindFailures = 2
 
 var log zerolog.Logger
 var sessions *dahua.SessionManager
@@ -249,40 +236,7 @@ func dahuaDial(serial, user, pass, channel, subtype string, p2pPort, maxRealms i
 	// Dial, so a Reconnect (a second consumer asking for a media after PLAY)
 	// gets a fresh realm instead of the dead one it just closed.
 	dialRealm := func() (net.Conn, error) {
-		c, err := client.Dial(client.RTSPPort())
-		if err != nil {
-			// A single BIND timeout does not prove the tunnel is dead: the
-			// device also refuses BINDs when briefly overloaded, and tearing
-			// the tunnel down then takes every sibling stream with it. But a
-			// device that keeps ACKing while refusing every BIND never
-			// recovers on its own, so repeated failures must still force a
-			// rebuild. Closing also lets siblings queued on the dial lock
-			// fail immediately rather than each waiting out its own timeout.
-			if errors.Is(err, dahua.ErrDialTimeout) {
-				switch {
-				case !client.IsResponsive(deadTunnelSilence):
-					// The device has gone quiet entirely, so every realm on
-					// this tunnel is already dead. Closing frees them and
-					// lets queued siblings fail immediately.
-					log.Warn().Str("serial", serial).
-						Msg("[dahua] device silent, closing tunnel")
-					client.Close()
-				case client.BindFailures() >= maxBindFailures:
-					// The device still talks to us and existing realms are
-					// still streaming; it just will not grant new ones.
-					// Retiring keeps those streams alive and sends the next
-					// caller to a fresh tunnel, where closing would take
-					// every healthy sibling down with it.
-					log.Warn().Str("serial", serial).
-						Int("bind_failures", client.BindFailures()).
-						Int("realms", client.ActiveRealms()).
-						Msg("[dahua] tunnel not granting realms, retiring")
-					client.Retire()
-				}
-			}
-			return nil, err
-		}
-		return c, nil
+		return client.Dial(client.RTSPPort())
 	}
 
 	rtspURL := (&url.URL{

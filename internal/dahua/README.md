@@ -39,4 +39,5 @@ streams:
   camera1: dahua://username:password@SERIAL?channel=1&p2p_port=51234
 ```
 
-Protocol details are in [pkg/dahua](../../pkg/dahua/README.md).
+Protocol details are in the standalone
+[dahua-p2p library](https://github.com/blackjid/dahua-p2p).
