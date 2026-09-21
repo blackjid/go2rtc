@@ -35,6 +35,11 @@ var log zerolog.Logger
 var sessions *dahua.SessionManager
 var defaultMaxRealms int
 
+// defaultSettle paces realm setup against the device. Zero leaves the
+// library's default; raise it when a device stalls with several streams
+// coming up at once, which is what a burst of realm setups does to it.
+var defaultSettle time.Duration
+
 // producer keeps Dahua-specific lifecycle and negotiation rules out of the
 // shared RTSP package. The initial lock stays held through all SETUP requests;
 // later GetTrack calls serialize any RTSP reconnect and its restored SETUPs.
@@ -99,7 +104,8 @@ func (p *producer) Stop() error {
 func Init() {
 	var cfg struct {
 		Mod struct {
-			MaxRealms int `yaml:"max_realms"`
+			MaxRealms       int           `yaml:"max_realms"`
+			NegotiateSettle time.Duration `yaml:"negotiate_settle"`
 		} `yaml:"dahua"`
 	}
 	app.LoadConfig(&cfg)
@@ -107,6 +113,7 @@ func Init() {
 	log = app.GetLogger("dahua")
 	sessions = dahua.NewSessionManager()
 	defaultMaxRealms = cfg.Mod.MaxRealms
+	defaultSettle = cfg.Mod.NegotiateSettle
 
 	streams.HandleFunc("dahua", dahuaHandler)
 
@@ -167,8 +174,14 @@ func dahuaHandler(rawURL string) (core.Producer, error) {
 		maxRealms = n
 	}
 
+	settle, err := parseNegotiateSettle(query.Get("negotiate_settle"))
+	if err != nil {
+		return nil, err
+	}
+
 	log.Info().Str("serial", serial).Str("channel", channel).Str("subtype", subtype).
-		Int("p2p_port", p2pPort).Int("max_realms", maxRealms).Msg("[dahua] connecting via P2P")
+		Int("p2p_port", p2pPort).Int("max_realms", maxRealms).
+		Dur("negotiate_settle", settle).Msg("[dahua] connecting via P2P")
 
 	// Each attempt already burns its own internal retries (3 BINDs, or 3
 	// direct-handshake attempts); these outer attempts exist to cover a
@@ -179,7 +192,7 @@ func dahuaHandler(rawURL string) (core.Producer, error) {
 
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		conn, err := dahuaDial(serial, user, pass, channel, subtype, p2pPort, maxRealms)
+		conn, err := dahuaDial(serial, user, pass, channel, subtype, p2pPort, maxRealms, settle)
 		if err == nil {
 			return conn, nil
 		}
@@ -202,13 +215,27 @@ func dahuaHandler(rawURL string) (core.Producer, error) {
 	return nil, lastErr
 }
 
-func dahuaDial(serial, user, pass, channel, subtype string, p2pPort, maxRealms int) (core.Producer, error) {
+// parseNegotiateSettle resolves the per-stream pacing override, falling back
+// to the module default. An explicit zero hands the decision to the library.
+func parseNegotiateSettle(s string) (time.Duration, error) {
+	if s == "" {
+		return defaultSettle, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("invalid negotiate_settle %q", s)
+	}
+	return d, nil
+}
+
+func dahuaDial(serial, user, pass, channel, subtype string, p2pPort, maxRealms int, settle time.Duration) (core.Producer, error) {
 	client, err := sessions.Acquire(dahua.Config{
-		Serial:    serial,
-		Username:  user,
-		Password:  pass,
-		P2PPort:   p2pPort,
-		MaxRealms: maxRealms,
+		Serial:          serial,
+		Username:        user,
+		Password:        pass,
+		P2PPort:         p2pPort,
+		MaxRealms:       maxRealms,
+		NegotiateSettle: settle,
 		// pkg/dahua owns no logger; wire its hooks to ours.
 		Trace: func(format string, v ...any) { log.Debug().Msgf("[dahua] "+format, v...) },
 		Error: func(format string, v ...any) { log.Warn().Msgf("[dahua] "+format, v...) },

@@ -31,7 +31,7 @@ require (
 
 require (
 	github.com/asticode/go-astikit v0.59.0 // indirect
-	github.com/blackjid/dahua-p2p v0.3.1-0.20260921183746-527e4355166e // indirect
+	github.com/blackjid/dahua-p2p v0.3.1-0.20260921190020-bc6fc1d73113 // indirect
 	github.com/mattn/go-colorable v0.1.16 // indirect
 	github.com/pion/datachannel v1.6.3 // indirect
 	github.com/pion/logging v0.2.4 // indirect
