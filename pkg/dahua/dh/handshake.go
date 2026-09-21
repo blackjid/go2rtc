@@ -356,80 +356,21 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 		return nil, fmt.Errorf("failed to request relay channel: %w", err)
 	}
 
-	// Step 9: Connect to agent for PTCP session
-	opts.trace("step 10: connecting to agent %s for PTCP", agentAddr)
-	if err = p2pClient.Connect(agentHost, agentPort); err != nil {
-		return nil, fmt.Errorf("failed to connect to agent for PTCP: %w", err)
-	}
-
-	// Read agent response (Server Nat Info)
-	opts.trace("step 10: reading agent NAT info")
-	_, err = p2pClient.ReadRaw(opts.Timeout)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read agent PTCP info: %w", err)
-	}
-
-	// Start PTCP session with agent
-	agentSession := ptcp.NewSession()
-
-	// Send PTCP SYNC to agent
-	opts.trace("step 10: PTCP sync with agent")
-	syncPacket := agentSession.Send(ptcp.NewSyncBody())
-	if err = p2pClient.Send(syncPacket.Serialize()); err != nil {
-		return nil, fmt.Errorf("failed to send PTCP sync to agent: %w", err)
-	}
-
-	// Read SYNC response
-	syncResp, err := p2pClient.ReadRaw(opts.Timeout)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read PTCP sync response from agent: %w", err)
-	}
-
-	syncRespPacket, err := ptcp.ParsePacket(syncResp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse PTCP sync response: %w", err)
-	}
-	agentSession.Recv(syncRespPacket)
-
-	opts.trace("PTCP session established with agent")
-
-	// Step 11: Request sign from agent (command 0x17)
-	opts.trace("step 11: requesting sign from agent")
-	signRequestCmd := []byte{0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	signReqPacket := agentSession.Send(ptcp.NewCommandBody(signRequestCmd))
-	if err = p2pClient.Send(signReqPacket.Serialize()); err != nil {
-		return nil, fmt.Errorf("failed to send sign request: %w", err)
-	}
-
+	// Steps 10-11 fetch a sign from the relay agent for the PTCP-level auth
+	// (command 0x19). Two DMSS captures show the app never does this when the
+	// p2p-channel request carried device auth (IpEncrptV2): it sends
+	// relay-channel, punches the device at once, and its PTCP session goes
+	// SYNC, SYNC, ACK, heartbeat, BIND with no 0x17/0x19/0x1B at all. The
+	// agent's "Server Nat Info" arrives unsolicited ~150ms later and is
+	// ignored. Blocking on it here was the dominant handshake failure: the
+	// agent frequently never sent it, and each wait cost the full timeout.
 	var sign []byte
-	for i := 0; i < 5; i++ {
-		signResp, readErr := p2pClient.ReadRaw(opts.Timeout)
-		if readErr != nil {
-			opts.trace("sign read timeout attempt=%d, resending request: %s", i+1, readErr)
-			signReqPacket = agentSession.Send(ptcp.NewCommandBody(signRequestCmd))
-			if sendErr := p2pClient.Send(signReqPacket.Serialize()); sendErr != nil {
-				opts.trace("failed to resend sign request: %s", sendErr)
-			}
-			continue
-		}
-		signRespPacket, parseErr := ptcp.ParsePacket(signResp)
-		if parseErr != nil {
-			continue
-		}
-		agentSession.Recv(signRespPacket)
-
-		if signRespPacket.Body.Type == ptcp.BodyTypeCommand && len(signRespPacket.Body.Command) > 12 {
-			sign = signRespPacket.Body.Command[12:]
-			break
+	if !needsAuth {
+		sign, err = agentSign(p2pClient, agentHost, agentPort, opts)
+		if err != nil {
+			return nil, err
 		}
 	}
-
-	if sign == nil {
-		err = fmt.Errorf("could not get sign from agent")
-		return nil, err
-	}
-
-	opts.trace("got sign")
 
 	// Step 12: punch a hole directly to the device.
 	// mainClient and p2pClient have served their purpose (address discovery
@@ -459,6 +400,77 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	deviceClient = nil
 	opts.trace("direct P2P connection established serial=%s", opts.Serial)
 	return &HandshakeResult{Client: keptDeviceClient, Session: session, RTSPPort: rtspPort}, nil
+}
+
+// agentSign obtains the PTCP auth sign from the relay agent: it waits for the
+// agent's NAT info, opens a PTCP session with the agent and asks it for the
+// sign (command 0x17). Only the unauthenticated p2p-channel flow needs it.
+func agentSign(p2pClient *UDPClient, agentHost string, agentPort int, opts HandshakeOptions) ([]byte, error) {
+	opts.trace("step 10: connecting to agent %s:%d for PTCP", agentHost, agentPort)
+	if err := p2pClient.Connect(agentHost, agentPort); err != nil {
+		return nil, fmt.Errorf("failed to connect to agent for PTCP: %w", err)
+	}
+
+	// Read agent response (Server Nat Info)
+	opts.trace("step 10: reading agent NAT info")
+	if _, err := p2pClient.ReadRaw(opts.Timeout); err != nil {
+		return nil, fmt.Errorf("failed to read agent PTCP info: %w", err)
+	}
+
+	// Start PTCP session with agent
+	agentSession := ptcp.NewSession()
+
+	// Send PTCP SYNC to agent
+	opts.trace("step 10: PTCP sync with agent")
+	syncPacket := agentSession.Send(ptcp.NewSyncBody())
+	if err := p2pClient.Send(syncPacket.Serialize()); err != nil {
+		return nil, fmt.Errorf("failed to send PTCP sync to agent: %w", err)
+	}
+
+	// Read SYNC response
+	syncResp, err := p2pClient.ReadRaw(opts.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read PTCP sync response from agent: %w", err)
+	}
+
+	syncRespPacket, err := ptcp.ParsePacket(syncResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PTCP sync response: %w", err)
+	}
+	agentSession.Recv(syncRespPacket)
+
+	opts.trace("PTCP session established with agent")
+
+	// Step 11: Request sign from agent (command 0x17)
+	opts.trace("step 11: requesting sign from agent")
+	signRequestCmd := []byte{0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	signReqPacket := agentSession.Send(ptcp.NewCommandBody(signRequestCmd))
+	if err := p2pClient.Send(signReqPacket.Serialize()); err != nil {
+		return nil, fmt.Errorf("failed to send sign request: %w", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		signResp, readErr := p2pClient.ReadRaw(opts.Timeout)
+		if readErr != nil {
+			opts.trace("sign read timeout attempt=%d, resending request: %s", i+1, readErr)
+			signReqPacket = agentSession.Send(ptcp.NewCommandBody(signRequestCmd))
+			if sendErr := p2pClient.Send(signReqPacket.Serialize()); sendErr != nil {
+				opts.trace("failed to resend sign request: %s", sendErr)
+			}
+			continue
+		}
+		signRespPacket, parseErr := ptcp.ParsePacket(signResp)
+		if parseErr != nil {
+			continue
+		}
+		agentSession.Recv(signRespPacket)
+
+		if signRespPacket.Body.Type == ptcp.BodyTypeCommand && len(signRespPacket.Body.Command) > 12 {
+			opts.trace("got sign")
+			return signRespPacket.Body.Command[12:], nil
+		}
+	}
+	return nil, fmt.Errorf("could not get sign from agent")
 }
 
 // performDirectHandshake performs the STUN-like handshake and PTCP authentication with the device
@@ -577,6 +589,18 @@ func performDirectHandshake(client *UDPClient, cid []byte, devicePubAddr, device
 		return nil, errors.New("expected SYNC response")
 	}
 
+	// Device auth already happened in the p2p-channel request: acknowledge
+	// the SYNC the way DMSS does and hand the session over.
+	if sign == nil {
+		ackPacket := session.Send(ptcp.NewEmptyBody())
+		if err := client.Send(ackPacket.Serialize()); err != nil {
+			return nil, fmt.Errorf("failed to send sync ack: %w", err)
+		}
+		drainHandshake(client, session)
+		opts.trace("PTCP session established with device")
+		return session, nil
+	}
+
 	// Send authentication with sign (command 0x19)
 	authCmd := []byte{0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 	authCmd = append(authCmd, sign...)
@@ -623,7 +647,16 @@ func performDirectHandshake(client *UDPClient, cid []byte, devicePubAddr, device
 		}
 	}
 
-	// Drain any additional pending packets the device sent during the handshake
+	drainHandshake(client, session)
+
+	opts.trace("PTCP session established with device")
+
+	return session, nil
+}
+
+// drainHandshake consumes any packets the device sent during the handshake so
+// the session counters stay in sync before the tunnel's reader takes over.
+func drainHandshake(client *UDPClient, session *ptcp.Session) {
 	for i := 0; i < 3; i++ {
 		extra, err := client.ReadRaw(500 * time.Millisecond)
 		if err != nil {
@@ -633,8 +666,4 @@ func performDirectHandshake(client *UDPClient, cid []byte, devicePubAddr, device
 			session.Recv(pkt)
 		}
 	}
-
-	opts.trace("PTCP session established with device")
-
-	return session, nil
 }
