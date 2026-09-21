@@ -16,7 +16,7 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/rtsp"
-	"github.com/blackjid/dahua-p2p"
+	"github.com/AlexxIT/go2rtc/pkg/dahua"
 	"github.com/rs/zerolog"
 )
 
