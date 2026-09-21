@@ -3,7 +3,7 @@ module github.com/AlexxIT/go2rtc
 go 1.24.0
 
 require (
-	github.com/blackjid/dahua-p2p v0.3.1-0.20260921190020-bc6fc1d73113
+	github.com/blackjid/dahua-p2p v0.3.1-0.20260921191322-310dc384ff86
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/expr-lang/expr v1.17.7
 	github.com/google/uuid v1.6.0
