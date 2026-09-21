@@ -2,8 +2,8 @@ github.com/asticode/go-astikit v0.59.0 h1:tjbwDym+MTSxqkAhJoHRZmHMXK6Jv4vGx+97Fp
 github.com/asticode/go-astikit v0.59.0/go.mod h1:fV43j20UZYfXzP9oBn33udkvCvDvCDhzjVqoLFuuYZE=
 github.com/asticode/go-astits v1.16.0 h1:MgyLnG30oRiQsHWQNXA29ZS6i7UNN/OGcPdgH86JJqg=
 github.com/asticode/go-astits v1.16.0/go.mod h1:psImoC1BhcAWIsyM/RnbO1OgUW+XSf8fZpFvF5McDyo=
-github.com/blackjid/dahua-p2p v0.2.0 h1:LfHbKN6psfJxHZlsv3ESRmHBjCzIFGqoHylyW1k7rXY=
-github.com/blackjid/dahua-p2p v0.2.0/go.mod h1:wmWaieRu6Ba2CbpkwlR+SHKNq2+gPnFV23iQWZdFp/g=
+github.com/blackjid/dahua-p2p v0.3.1-0.20260921183746-527e4355166e h1:hHY4ND8f84Jrrsw4V2lVQNnCKbOJbTo6O4SKocwCXDY=
+github.com/blackjid/dahua-p2p v0.3.1-0.20260921183746-527e4355166e/go.mod h1:wmWaieRu6Ba2CbpkwlR+SHKNq2+gPnFV23iQWZdFp/g=
 github.com/eclipse/paho.mqtt.golang v1.5.1 h1:/VSOv3oDLlpqR2Epjn1Q7b2bSTplJIeV2ISgCl2W7nE=
 github.com/eclipse/paho.mqtt.golang v1.5.1/go.mod h1:1/yJCneuyOoCOzKSsOTUc0AJfpsItBGWvYpBLimhArU=
 github.com/expr-lang/expr v1.17.8 h1:W1loDTT+0PQf5YteHSTpju2qfUfNoBt4yw9+wOEU9VM=
