@@ -28,7 +28,14 @@ type Session struct {
 	peerSent uint32
 	peerRecv uint32
 	peerRMID uint32
+
+	// pending holds data that arrived past a hole, keyed by the byte offset
+	// the peer stamped on it, until the hole is filled or skipped.
+	pending map[uint32]*Packet
 }
+
+// maxPending bounds how many out-of-order packets are held for a hole.
+const maxPending = 1024
 
 // Stats is a snapshot of both endpoints' counters, used to detect loss.
 type Stats struct {
@@ -172,17 +179,111 @@ func (s *Session) Send(body *Body) *Packet {
 	return NewPacket(header, body)
 }
 
-// Recv processes a received packet and updates session state
+// Recv files a received packet; see Receive. It is for callers that handle
+// one packet at a time in lockstep, like the handshake.
 func (s *Session) Recv(packet *Packet) *Packet {
+	s.Receive(packet)
+	return packet
+}
+
+// Receive files an inbound packet and returns the packets that are now
+// deliverable, in byte order.
+//
+// Sent and Recv in the header are byte offsets into each direction's stream,
+// as in TCP, not free-running counters: a packet's Sent is the offset of its
+// first body byte. Counting every arrival as the next bytes -- what this used
+// to do -- turns one lost datagram into a permanent disagreement about where
+// the stream is, and the device stops consuming anything past it. So a
+// packet at our offset is delivered, one behind it is a duplicate and
+// dropped, and one ahead of it waits in pending for the hole to fill.
+func (s *Session) Receive(packet *Packet) (ready []*Packet, dup bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.recv += uint32(packet.Body.Len())
-	s.rmid = packet.Header.LMID
+	h := packet.Header
+	s.rmid = h.LMID
+	if delta(h.Sent, s.peerSent) > 0 || s.peerSent == 0 {
+		s.peerSent = h.Sent
+	}
+	if delta(h.Recv, s.peerRecv) > 0 || s.peerRecv == 0 {
+		s.peerRecv = h.Recv
+	}
+	s.peerRMID = h.RMID
 
-	s.peerSent = packet.Header.Sent
-	s.peerRecv = packet.Header.Recv
-	s.peerRMID = packet.Header.RMID
+	n := uint32(packet.Body.Len())
+	if n == 0 {
+		return nil, false
+	}
+	switch off := delta(h.Sent, s.recv); {
+	case off < 0:
+		return nil, true
+	case off > 0:
+		if s.pending == nil {
+			s.pending = make(map[uint32]*Packet)
+		}
+		if len(s.pending) < maxPending {
+			s.pending[h.Sent] = packet
+		}
+		return nil, false
+	}
+	s.recv += n
+	return s.drain(append(ready, packet)), false
+}
 
-	return packet
+// drain appends every pending packet that the stream has now reached.
+// Must be called with s.mu held.
+func (s *Session) drain(ready []*Packet) []*Packet {
+	for {
+		p, ok := s.pending[s.recv]
+		if !ok {
+			break
+		}
+		delete(s.pending, s.recv)
+		s.recv += uint32(p.Body.Len())
+		ready = append(ready, p)
+	}
+	// Anything the stream has overtaken is stale.
+	for off := range s.pending {
+		if delta(off, s.recv) < 0 {
+			delete(s.pending, off)
+		}
+	}
+	return ready
+}
+
+// Gap reports whether data is waiting behind a hole in the inbound stream.
+func (s *Session) Gap() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending) > 0
+}
+
+// SkipGap gives up on the hole: the stream jumps to the earliest data that
+// did arrive, and that data and whatever follows it is returned. skipped is
+// how many bytes were never received.
+func (s *Session) SkipGap() (ready []*Packet, skipped uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	first, ok := uint32(0), false
+	for off := range s.pending {
+		if !ok || delta(off, first) < 0 {
+			first, ok = off, true
+		}
+	}
+	if !ok {
+		return nil, 0
+	}
+	skipped = first - s.recv
+	s.recv = first
+	return s.drain(nil), skipped
+}
+
+// Resend rebuilds a packet already sent at offset seq, with the current
+// acknowledgement fields, without advancing our own offset.
+func (s *Session) Resend(seq uint32, body *Body) *Packet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	header := &Header{Sent: seq, Recv: s.recv, LMID: s.lmid(), RMID: s.rmid, PID: s.pid()}
+	s.lastPIDRecv = s.recv
+	return NewPacket(header, body)
 }

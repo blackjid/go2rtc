@@ -244,6 +244,7 @@ func TestACKIsCountedInPacketsNotTime(t *testing.T) {
 	if tun.ackTimer == nil {
 		t.Fatal("no backstop timer armed for a flow that stops at one packet")
 	}
+	tun.ackTimer.Stop() // the bare tunnel has nothing to send it with
 }
 
 func TestACKCountResetsAfterFlush(t *testing.T) {
