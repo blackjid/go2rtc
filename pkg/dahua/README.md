@@ -25,8 +25,8 @@ PTCP ("phony TCP") multiplexes connections over one UDP socket as *realms*.
 └────────────────────────────────────────────────────────────┘
 ```
 
-`0x00` SYNC, `0x10` payload, `0x11` BIND, `0x12` status (`CONN`/`DISC`),
-`0x13` heartbeat, `0x17`-`0x1B` handshake commands.
+`0x00` SYNC, `0x0a` NACK, `0x10` payload, `0x11` BIND, `0x12` status
+(`CONN`/`DISC`), `0x13` heartbeat, `0x17`-`0x1B` handshake commands.
 
 Neither ID field in the header is an identifier. Both were originally modelled
 as counters, which is wrong in a way that degrades slowly, so a capture of the
@@ -88,6 +88,23 @@ healthy sample, eight realms streaming 17 MB, read `out_unacked=0
 out_lag_ms=5000 in_skew=-503`. It also climbs while the tunnel is idle,
 because the clock runs whether or not we send.
 
-Measured over 124 MB across 7 realms the device acknowledged every byte sent,
-which is why no retransmission layer is implemented. Revisit if `out_unacked`
-is seen climbing on some other network.
+## Reliability
+
+`Sent` and `Recv` are byte offsets into each direction's stream, as in TCP, and
+the device runs a reliable transport over them. Probed live:
+
+- A data packet we never acknowledge is resent ~250ms later at the same `Sent`.
+- A hole in *our* stream stops the device consuming anything after it. It asks
+  for the missing bytes with a `0x0a` body, `0a 00 08 <offset> 00000000
+  <length>`, repeated every ~10ms, and goes silent if they never come.
+  Resending them resumes the stream at once.
+- The `0x0a` NACK is out of band: the device's next data packet carries the
+  same `Sent`, so it must not be counted.
+
+So the session delivers inbound data in offset order, drops duplicates, holds
+data that arrives past a hole, and skips a hole the device has not filled in
+1.5s. The tunnel keeps every outbound packet until the device's `Recv` passes
+it and resends the queue on a NACK, or when the device has answered since
+without covering it. Before this, one lost datagram in either direction left
+the two ends disagreeing about the stream for good: substreams rarely hit it,
+eight main streams hit it within hours.

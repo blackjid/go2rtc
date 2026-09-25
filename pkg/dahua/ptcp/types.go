@@ -20,6 +20,14 @@ const (
 	TypeStatus    byte = 0x12 // Connection status (CONN/DISC)
 	TypeHeartbeat byte = 0x13 // Heartbeat, len is always 0
 
+	// TypeNack asks for a retransmission. Measured live: after we left a
+	// 58-byte hole at offset 83 the device sent 0a 00 08 53 00000000 003a00
+	// -- the hole's offset (0x53) and length (0x3a) -- every ~10ms, all at
+	// the same Sent, and the next data packet reused that Sent too. It is
+	// out of band: it names a position in our stream rather than taking one
+	// in the device's.
+	TypeNack byte = 0x0a
+
 	// Types 0x17-0x1B carry the handshake command exchange (sign request,
 	// auth, auth response, auth ack). They are written as literals in
 	// dh.Handshake and parsed here as BodyTypeCommand.
@@ -92,6 +100,7 @@ const (
 	BodyTypeBind
 	BodyTypeStatus
 	BodyTypeHeartbeat
+	BodyTypeNack
 )
 
 // Body represents the PTCP packet body
@@ -171,6 +180,8 @@ func (b *Body) Len() int {
 		return len(b.Status) + 12
 	case BodyTypeHeartbeat:
 		return 12
+	case BodyTypeNack:
+		return 0 // out of band; see TypeNack
 	default:
 		return 0
 	}
@@ -183,7 +194,7 @@ func (b *Body) Serialize() []byte {
 		return nil
 	case BodyTypeSync:
 		return []byte{0x00, 0x03, 0x01, 0x00}
-	case BodyTypeCommand:
+	case BodyTypeCommand, BodyTypeNack:
 		return b.Command
 	case BodyTypePayload:
 		length := uint32(len(b.Data))
@@ -267,6 +278,8 @@ func ParseBody(data []byte) (*Body, error) {
 		return NewStatusBody(realm, status), nil
 	case TypeHeartbeat:
 		return NewHeartbeatBody(), nil
+	case TypeNack:
+		return &Body{Type: BodyTypeNack, Command: data}, nil
 	default:
 		// Treat as command
 		return NewCommandBody(data), nil

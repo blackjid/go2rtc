@@ -198,7 +198,7 @@ func TestSessionPIDReportsBytesTakenSinceLastSend(t *testing.T) {
 func TestSessionPIDStaysInBand(t *testing.T) {
 	s := NewSession()
 	for i := 0; i < 70000; i++ {
-		s.Recv(NewPacket(&Header{}, NewHeartbeatBody()))
+		s.Recv(NewPacket(&Header{Sent: uint32(i * 12)}, NewHeartbeatBody()))
 		pkt := s.Send(NewHeartbeatBody())
 		if pkt.Header.PID > 0x0000FFFF {
 			t.Fatalf("packet %d: PID %#08x exceeds 16 bits", i, pkt.Header.PID)

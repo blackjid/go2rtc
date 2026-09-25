@@ -19,6 +19,29 @@ import (
 // need a nil check.
 func nopLog(string, ...any) {}
 
+// outPacket is a sent packet the device has not yet acknowledged.
+type outPacket struct {
+	seq  uint32
+	body *ptcp.Body
+	at   time.Time
+}
+
+// Retransmission timing. A BIND the device means to answer comes back in
+// 10-40ms, so a quarter second without an acknowledgement is loss, not delay
+// -- provided the device has said something since and left our packet out.
+// A device that has said nothing gets rtoSilent before we repeat ourselves:
+// nothing in either capture shows how it treats a duplicate, so we do not
+// send one on a guess.
+const (
+	rtoBase      = 250 * time.Millisecond
+	rtoSilent    = time.Second
+	rtoMax       = 2 * time.Second
+	maxOutQueue  = 4096
+	gapSkipAfter = 1500 * time.Millisecond
+)
+
+func seqDelta(a, b uint32) int32 { return int32(a - b) }
+
 // Errors
 var (
 	ErrTunnelClosed  = errors.New("tunnel is closed")
@@ -101,6 +124,21 @@ type Tunnel struct {
 	// heartbeats the tunnel emits on its own.
 	payloadWrites atomic.Uint64
 
+	// Outbound reliability. Every packet with a body stays in outq until the
+	// device's Recv passes it, and is resent from its original offset if it
+	// does not. The device delivers our bytes in order, so one lost datagram
+	// otherwise holds back everything after it for good.
+	outMu sync.Mutex
+	outq  []outPacket
+	rto   time.Duration
+	// nack wakes the retransmitter when the device asks for a resend.
+	nack     chan struct{}
+	nackOnce sync.Once
+
+	// gapSince is when the inbound stream first stalled behind a hole.
+	// Touched only by the reader goroutine.
+	gapSince time.Time
+
 	// ACK coalescing: batch multiple received packets into a single ACK.
 	// ackMu also guards consecutiveSendErrs, which only flushACK touches.
 	ackPending          bool
@@ -175,6 +213,7 @@ func New(cfg Config) (*Tunnel, error) {
 
 	// Start reader goroutine
 	go t.reader()
+	go t.retransmitter()
 
 	// Start heartbeat
 	t.startHeartbeat()
@@ -271,7 +310,134 @@ func (t *Tunnel) sendPacketFor(body *ptcp.Body, writer *Conn) error {
 	}
 
 	packet := t.session.Send(body)
+	if n := body.Len(); n > 0 {
+		t.outMu.Lock()
+		t.outq = append(t.outq, outPacket{seq: packet.Header.Sent, body: body, at: time.Now()})
+		over := len(t.outq) > maxOutQueue
+		t.outMu.Unlock()
+		if over {
+			go func() {
+				t.errorf("device acknowledged nothing of %d queued packets, closing tunnel", maxOutQueue)
+				t.Close()
+			}()
+		}
+	}
 	return t.client.Send(packet.Serialize())
+}
+
+// pruneOutbound drops every queued packet the device has acknowledged.
+func (t *Tunnel) pruneOutbound() {
+	peer := t.session.Stats().PeerRecv
+	t.outMu.Lock()
+	defer t.outMu.Unlock()
+	i := 0
+	for i < len(t.outq) && seqDelta(t.outq[i].seq+uint32(t.outq[i].body.Len()), peer) <= 0 {
+		i++
+	}
+	if i > 0 {
+		t.outq = append(t.outq[:0], t.outq[i:]...)
+		t.rto = rtoBase
+	}
+}
+
+// retransmitter resends whatever the device has left unacknowledged for
+// longer than the retransmission timeout. It resends the whole queue, in
+// order: the device discards anything past a hole, so everything after the
+// lost packet was lost with it.
+func (t *Tunnel) retransmitter() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	var lastNack time.Time
+	for {
+		asked := false
+		select {
+		case <-t.done:
+			return
+		case <-ticker.C:
+		case <-t.nackChan():
+			// The device repeats a NACK every ~10ms until the hole fills;
+			// one resend per round trip answers all of them.
+			asked = time.Since(lastNack) > 100*time.Millisecond
+			if asked {
+				lastNack = time.Now()
+			}
+		}
+
+		t.outMu.Lock()
+		if t.rto == 0 {
+			t.rto = rtoBase
+		}
+		if len(t.outq) == 0 || !(asked || t.overdue(t.outq[0].at)) {
+			t.outMu.Unlock()
+			continue
+		}
+		now := time.Now()
+		resend := make([]outPacket, len(t.outq))
+		copy(resend, t.outq)
+		for i := range t.outq {
+			t.outq[i].at = now
+		}
+		rto := t.rto
+		t.rto = min(t.rto*2, rtoMax)
+		t.outMu.Unlock()
+
+		t.trace("retransmit packets=%d from=%d rto=%s", len(resend), resend[0].seq, rto)
+		for _, op := range resend {
+			if err := t.acquireSendPermit(nil); err != nil {
+				return
+			}
+			pkt := t.session.Resend(op.seq, op.body)
+			err := t.client.Send(pkt.Serialize())
+			t.sendPermit <- struct{}{}
+			if err != nil {
+				break
+			}
+		}
+	}
+}
+
+func (t *Tunnel) nackChan() chan struct{} {
+	t.nackOnce.Do(func() { t.nack = make(chan struct{}, 1) })
+	return t.nack
+}
+
+// overdue reports whether a packet sent at `at` is lost: the device has
+// answered since without covering it, or has been silent past rtoSilent.
+// Must be called with outMu held.
+func (t *Tunnel) overdue(at time.Time) bool {
+	age := time.Since(at)
+	if age < t.rto {
+		return false
+	}
+	t.lastAckTimeMu.Lock()
+	heard := t.lastAckTime.After(at.Add(20 * time.Millisecond))
+	t.lastAckTimeMu.Unlock()
+	return heard || age >= max(t.rto, rtoSilent)
+}
+
+// noteGap starts the clock on a hole in the inbound stream.
+func (t *Tunnel) noteGap() {
+	if t.gapSince.IsZero() {
+		t.gapSince = time.Now()
+	}
+}
+
+// skipStaleGap gives up on a hole the device has not filled in time and
+// delivers what arrived after it. The bytes in the hole belonged to some
+// realm's stream; which one is not knowable, so that stream takes a
+// corrupt read instead of every realm on the tunnel stalling behind it.
+// Called only from the reader goroutine.
+func (t *Tunnel) skipStaleGap() {
+	if t.gapSince.IsZero() || time.Since(t.gapSince) < gapSkipAfter {
+		return
+	}
+	t.gapSince = time.Time{}
+	ready, skipped := t.session.SkipGap()
+	t.errorf("inbound hole of %d bytes not resent in %s, skipping", skipped, gapSkipAfter)
+	for _, p := range ready {
+		t.dispatch(p)
+	}
+	t.flushACK()
 }
 
 func (t *Tunnel) acquireSendPermit(writer *Conn) error {
@@ -615,7 +781,9 @@ func (t *Tunnel) reader() {
 		default:
 		}
 
-		data, err := t.client.ReadRaw(1 * time.Second)
+		t.skipStaleGap()
+
+		data, err := t.client.ReadRaw(250 * time.Millisecond)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
@@ -643,82 +811,113 @@ func (t *Tunnel) reader() {
 		}
 
 		t.ackHeartbeat()
-		t.session.Recv(packet)
-
-		switch packet.Body.Type {
-		case ptcp.BodyTypeEmpty:
-			// Don't ACK empty packets; they are ACKs themselves.
-			continue
-
-		case ptcp.BodyTypeSync:
+		// A SYNC is answered whatever its offset; everything else is
+		// delivered in stream order.
+		if packet.Body.Type == ptcp.BodyTypeSync {
 			_ = t.sendPacket(ptcp.NewSyncBody())
+		}
+		ready, dup := t.session.Receive(packet)
+		t.pruneOutbound()
+		if packet.Body.Type == ptcp.BodyTypeNack {
+			select {
+			case t.nackChan() <- struct{}{}:
+			default:
+			}
 			continue
-
-		case ptcp.BodyTypeStatus:
-			realm := packet.Body.Realm
-			status := packet.Body.Status
-
-			t.trace("PTCP status realm=%d status=%s", realm, status)
-
-			if status == ptcp.StatusConnect {
-				t.connChMu.Lock()
-				if ch, ok := t.connCh[realm]; ok {
-					ch <- true
-					delete(t.connCh, realm)
-				} else {
-					t.errorf("reader: StatusConnect for unknown realm=%d", realm)
-				}
-				t.connChMu.Unlock()
-			} else if status == ptcp.StatusDisconnect {
-				// Device initiated disconnect: signal the Conn and remove realm.
-				t.realmsMu.Lock()
-				conn, ok := t.realms[realm]
-				if ok {
-					delete(t.realms, realm)
-				}
-				t.realmsMu.Unlock()
-				if ok {
-					conn.signalClosed()
-				}
-			}
-
-			t.scheduleACK()
-
-		case ptcp.BodyTypePayload:
-			realm := packet.Body.Realm
-			t.realmsMu.RLock()
-			conn, ok := t.realms[realm]
-			t.realmsMu.RUnlock()
-
-			if ok {
-				// Never block the reader: it serves every realm on this
-				// tunnel, so one slow consumer must not stall the others.
-				// When the buffer is full we tear the realm down rather than
-				// drop bytes, since a hole in the middle of an RTSP stream is
-				// worse than a clean EOF.
-				select {
-				case conn.dataCh <- packet.Body.Data:
-				default:
-					t.errorf("payload channel full, closing realm=%d", realm)
-					t.realmsMu.Lock()
-					delete(t.realms, realm)
-					t.realmsMu.Unlock()
-					conn.signalClosed()
-					_ = t.sendPacket(ptcp.NewStatusBody(realm, ptcp.StatusDisconnect))
-				}
-			} else {
-				t.errorf("reader: payload for unknown realm=%d len=%d", realm, len(packet.Body.Data))
-			}
-
-			t.scheduleACK()
-
-		case ptcp.BodyTypeHeartbeat:
-			t.scheduleACK()
-
-		default:
-			t.trace("reader: unhandled body type=%d", int(packet.Body.Type))
+		}
+		switch {
+		case dup:
+			// A retransmission of something we have: the device did not see
+			// our ACK. Tell it again now rather than on the coalescing clock.
+			t.flushACK()
+			continue
+		case len(ready) == 0 && packet.Body.Len() > 0:
+			// Data past a hole. Acknowledge at once so the device learns
+			// where we are stuck and resends from there.
+			t.noteGap()
+			t.flushACK()
+			continue
+		}
+		if !t.session.Gap() {
+			t.gapSince = time.Time{}
+		}
+		for _, p := range ready {
+			t.dispatch(p)
 		}
 	}
+}
+
+// dispatch handles one inbound packet that is next in stream order.
+func (t *Tunnel) dispatch(packet *ptcp.Packet) {
+	switch packet.Body.Type {
+	case ptcp.BodyTypeSync:
+		return // answered on arrival
+
+	case ptcp.BodyTypeStatus:
+		realm := packet.Body.Realm
+		status := packet.Body.Status
+
+		t.trace("PTCP status realm=%d status=%s", realm, status)
+
+		if status == ptcp.StatusConnect {
+			t.connChMu.Lock()
+			if ch, ok := t.connCh[realm]; ok {
+				ch <- true
+				delete(t.connCh, realm)
+			} else {
+				t.errorf("reader: StatusConnect for unknown realm=%d", realm)
+			}
+			t.connChMu.Unlock()
+		} else if status == ptcp.StatusDisconnect {
+			// Device initiated disconnect: signal the Conn and remove realm.
+			t.realmsMu.Lock()
+			conn, ok := t.realms[realm]
+			if ok {
+				delete(t.realms, realm)
+			}
+			t.realmsMu.Unlock()
+			if ok {
+				conn.signalClosed()
+			}
+		}
+
+		t.scheduleACK()
+
+	case ptcp.BodyTypePayload:
+		realm := packet.Body.Realm
+		t.realmsMu.RLock()
+		conn, ok := t.realms[realm]
+		t.realmsMu.RUnlock()
+
+		if ok {
+			// Never block the reader: it serves every realm on this
+			// tunnel, so one slow consumer must not stall the others.
+			// When the buffer is full we tear the realm down rather than
+			// drop bytes, since a hole in the middle of an RTSP stream is
+			// worse than a clean EOF.
+			select {
+			case conn.dataCh <- packet.Body.Data:
+			default:
+				t.errorf("payload channel full, closing realm=%d", realm)
+				t.realmsMu.Lock()
+				delete(t.realms, realm)
+				t.realmsMu.Unlock()
+				conn.signalClosed()
+				_ = t.sendPacket(ptcp.NewStatusBody(realm, ptcp.StatusDisconnect))
+			}
+		} else {
+			t.errorf("reader: payload for unknown realm=%d len=%d", realm, len(packet.Body.Data))
+		}
+
+		t.scheduleACK()
+
+	case ptcp.BodyTypeHeartbeat:
+		t.scheduleACK()
+
+	default:
+		t.trace("reader: unhandled body type=%d", int(packet.Body.Type))
+	}
+
 }
 
 // ACK coalescing is counted in packets, not time. The device paces itself at
@@ -1075,7 +1274,7 @@ func (c *Conn) Close() error {
 	}
 
 	if !c.tunnel.IsClosed() {
-		const discRetries = 3
+		const discRetries = 1 // delivery is reliable; see retransmitter
 		const discInterval = 50 * time.Millisecond
 		for i := 0; i < discRetries; i++ {
 			if err := c.tunnel.sendPacket(ptcp.NewStatusBody(c.realmID, ptcp.StatusDisconnect)); err != nil {
