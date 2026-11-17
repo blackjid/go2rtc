@@ -258,6 +258,7 @@ func exitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	app.Shutdown()
 	os.Exit(code)
 }
 
@@ -275,7 +276,10 @@ func restartHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Debug().Msgf("[api] restart %s", path)
 
-	go syscall.Exec(path, os.Args, os.Environ())
+	go func() {
+		app.Shutdown()
+		_ = syscall.Exec(path, os.Args, os.Environ())
+	}()
 }
 
 func logHandler(w http.ResponseWriter, r *http.Request) {

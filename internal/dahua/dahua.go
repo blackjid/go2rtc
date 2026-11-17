@@ -15,8 +15,8 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/pkg/core"
-	"github.com/AlexxIT/go2rtc/pkg/rtsp"
 	"github.com/AlexxIT/go2rtc/pkg/dahua"
+	"github.com/AlexxIT/go2rtc/pkg/rtsp"
 	"github.com/rs/zerolog"
 )
 
@@ -116,14 +116,15 @@ func Init() {
 	defaultSettle = cfg.Mod.NegotiateSettle
 
 	streams.HandleFunc("dahua", dahuaHandler)
+	app.OnShutdown(shutdown)
 
 	api.HandleFunc("api/dahua", apiDahua)
 }
 
-// Shutdown closes all active P2P sessions, notifying devices of disconnection.
-// Call this on process exit so devices can immediately free the P2P session
-// instead of waiting for heartbeat timeout.
-func Shutdown() {
+// shutdown closes all active P2P sessions, notifying devices of disconnection,
+// so devices can free the P2P session at once instead of waiting for the
+// heartbeat timeout.
+func shutdown() {
 	if sessions != nil {
 		log.Debug().Msg("[dahua] shutting down P2P sessions")
 		sessions.CloseAll()

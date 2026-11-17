@@ -8,8 +8,8 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/api/ws"
 	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/AlexxIT/go2rtc/internal/bubble"
-	"github.com/AlexxIT/go2rtc/internal/debug"
 	"github.com/AlexxIT/go2rtc/internal/dahua"
+	"github.com/AlexxIT/go2rtc/internal/debug"
 	"github.com/AlexxIT/go2rtc/internal/doorbird"
 	"github.com/AlexxIT/go2rtc/internal/dvrip"
 	"github.com/AlexxIT/go2rtc/internal/echo"
@@ -125,5 +125,5 @@ func main() {
 
 	shell.RunUntilSignal()
 
-	dahua.Shutdown()
+	app.Shutdown()
 }
