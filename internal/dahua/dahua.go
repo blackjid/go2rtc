@@ -21,10 +21,22 @@ import (
 )
 
 // negotiateLockTimeout bounds how long dahuaDial waits behind other streams
-// for the per-client negotiate lock. Each negotiation is a BIND (up to 3 x 5s)
+// for the per-client negotiate lock. Each negotiation is a BIND (one, 2s)
 // plus a DESCRIBE (15s), so a full tunnel can legitimately queue for a while;
 // past this we would rather fail and let the caller retry than hang a stream.
 const negotiateLockTimeout = 90 * time.Second
+
+// dialBudget bounds a whole dahuaHandler call, across its attempts. The
+// caller holds the stream's producer lock throughout, so stopping the stream
+// waits on it too.
+const dialBudget = 2 * time.Minute
+
+// negotiateHoldGrace is how long a dialed producer keeps the negotiate lock
+// waiting for its SETUPs. go2rtc dials every source of a stream before
+// starting any, so a second dahua:// source for the same device in one
+// stream is dialed by the goroutine that holds the lock for the first; held
+// until Start, the lock would block that goroutine against itself.
+const negotiateHoldGrace = 2 * time.Second
 
 // rtspCmdTimeout applies to RTSP command exchanges over the tunnel. The
 // package default (5s) is tuned for LAN cameras and is too tight for an NVR
@@ -50,12 +62,16 @@ type producer struct {
 	serial        string
 	negotiateMu   sync.Mutex
 	negotiateHeld bool
+	holdTimer     *time.Timer // releases the lock if SETUPs stop coming
 	releaseOnce   sync.Once
 }
 
 func (p *producer) finishNegotiateLocked() {
 	if !p.negotiateHeld {
 		return
+	}
+	if p.holdTimer != nil {
+		p.holdTimer.Stop()
 	}
 	p.client.DoneNegotiate()
 	p.client.UnlockNegotiate()
@@ -73,9 +89,13 @@ func (p *producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receive
 	defer p.negotiateMu.Unlock()
 
 	// The initial negotiation lock is acquired by dahuaDial before DESCRIBE
-	// and remains held until Start. Once streaming, GetTrack may reconnect the
-	// RTSP client, so each call takes the lock for its full Dial/DESCRIBE/SETUP.
-	if !p.negotiateHeld {
+	// and remains held until Start, or until no SETUP has come for
+	// negotiateHoldGrace. Once released, GetTrack may reconnect the RTSP
+	// client, so each call takes the lock for its full Dial/DESCRIBE/SETUP.
+	if p.negotiateHeld {
+		p.holdTimer.Stop()
+		defer p.holdTimer.Reset(negotiateHoldGrace)
+	} else {
 		ctx, cancel := context.WithTimeout(context.Background(), negotiateLockTimeout)
 		defer cancel()
 		if err := p.client.LockNegotiate(ctx); err != nil {
@@ -184,16 +204,19 @@ func dahuaHandler(rawURL string) (core.Producer, error) {
 		Int("p2p_port", p2pPort).Int("max_realms", maxRealms).
 		Dur("negotiate_settle", settle).Msg("[dahua] connecting via P2P")
 
-	// Each attempt already burns its own internal retries (3 BINDs, or 3
-	// direct-handshake attempts); these outer attempts exist to cover a
-	// tunnel that died and has to be rebuilt from scratch. 2s is enough
-	// breathing room for the device without exceeding HA's stream timeout.
+	// Each attempt already burns its own internal retries (3 direct-handshake
+	// attempts); these outer attempts exist to cover a tunnel that died and
+	// has to be rebuilt from scratch. 2s is enough breathing room for the
+	// device without exceeding HA's stream timeout.
 	const maxAttempts = 4
 	const backoff = 2 * time.Second
 
+	ctx, cancel := context.WithTimeout(context.Background(), dialBudget)
+	defer cancel()
+
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		conn, err := dahuaDial(serial, user, pass, channel, subtype, p2pPort, maxRealms, settle)
+		conn, err := dahuaDial(ctx, serial, user, pass, channel, subtype, p2pPort, maxRealms, settle)
 		if err == nil {
 			return conn, nil
 		}
@@ -208,9 +231,18 @@ func dahuaHandler(rawURL string) (core.Producer, error) {
 				Msg("[dahua] tunnel retired, retrying on a fresh tunnel")
 			continue
 		}
+		if ctx.Err() != nil {
+			break
+		}
 		log.Warn().Err(err).Int("attempt", i+1).Int("max", maxAttempts).
 			Str("serial", serial).Msg("[dahua] connection failed, retrying")
-		time.Sleep(backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	log.Error().Err(lastErr).Str("serial", serial).Msg("[dahua] all connection attempts failed")
 	return nil, lastErr
@@ -229,7 +261,7 @@ func parseNegotiateSettle(s string) (time.Duration, error) {
 	return d, nil
 }
 
-func dahuaDial(serial, user, pass, channel, subtype string, p2pPort, maxRealms int, settle time.Duration) (core.Producer, error) {
+func dahuaDial(parent context.Context, serial, user, pass, channel, subtype string, p2pPort, maxRealms int, settle time.Duration) (core.Producer, error) {
 	client, err := sessions.Acquire(dahua.Config{
 		Serial:          serial,
 		Username:        user,
@@ -247,7 +279,7 @@ func dahuaDial(serial, user, pass, channel, subtype string, p2pPort, maxRealms i
 
 	// Serialize RTSP negotiation: the device can't reliably handle
 	// concurrent OPTIONS/DESCRIBE/SETUP through the PTCP tunnel.
-	ctx, cancel := context.WithTimeout(context.Background(), negotiateLockTimeout)
+	ctx, cancel := context.WithTimeout(parent, negotiateLockTimeout)
 	defer cancel()
 	if err := client.LockNegotiate(ctx); err != nil {
 		sessions.Release(serial, client)
@@ -309,12 +341,17 @@ func dahuaDial(serial, user, pass, channel, subtype string, p2pPort, maxRealms i
 		return nil
 	}
 
-	return &producer{
+	p := &producer{
 		Conn:          conn,
 		client:        client,
 		serial:        serial,
 		negotiateHeld: true,
-	}, nil
+	}
+	// Under negotiateMu so the timer's finishNegotiate sees holdTimer set.
+	p.negotiateMu.Lock()
+	p.holdTimer = time.AfterFunc(negotiateHoldGrace, p.finishNegotiate)
+	p.negotiateMu.Unlock()
+	return p, nil
 }
 
 func apiDahua(w http.ResponseWriter, r *http.Request) {
