@@ -100,31 +100,34 @@ func TestLockNegotiateGivesUpOnRetiredTunnel(t *testing.T) {
 	}
 }
 
-// A reserve tunnel is only worth holding if it is a tunnel of its own. Room
-// left on a live tunnel is not a reserve: it disappears the moment that
-// tunnel goes deaf to BINDs. The fixed port makes the test observable without
-// a handshake, because a second tunnel cannot bind it.
-func TestAcquireFreshIgnoresRoomOnLiveTunnels(t *testing.T) {
-	cfg := Config{Serial: "device", P2PPort: 5000, MaxRealms: 4}
+// A fixed port admits one tunnel. One that is retired or silent can take no
+// new stream, so it must make way instead of blocking every Acquire until it
+// dies on its own. A healthy one, even full, stays.
+func TestFixedPortEvictsOnlyUnusableTunnels(t *testing.T) {
+	cfg := Config{Serial: "device", P2PPort: 5000, MaxRealms: 1}
 	key := sessionKeyFor(cfg)
-	client := &Client{tunnel: liveTunnel()}
+
+	retired := &Client{tunnel: liveTunnel()}
+	retired.Retire()
+	silent := &Client{tunnel: &tunnel.Tunnel{}}
+	healthy := &Client{tunnel: liveTunnel()}
+
 	manager := NewSessionManager()
-	manager.sessions[key] = []*managedSession{{client: client, maxRealms: 4}}
-
-	if got, err := manager.Acquire(cfg); err != nil || got != client {
-		t.Fatalf("Acquire with room to spare = %v, %v; want the live tunnel", got, err)
+	manager.sessions[key] = []*managedSession{
+		{client: retired, refCount: 1, maxRealms: 1},
+		{client: silent, refCount: 0, maxRealms: 1},
+		{client: healthy, refCount: 1, maxRealms: 1},
 	}
-	if _, err := manager.AcquireFresh(cfg); !errors.Is(err, ErrFixedPortCapacity) {
-		t.Fatalf("AcquireFresh = %v, want ErrFixedPortCapacity rather than the live tunnel", err)
+
+	stale := manager.evictUnusable(key)
+	if len(stale) != 2 || stale[0].client != retired || stale[1].client != silent {
+		t.Fatalf("evicted %d sessions, want the retired and the silent one", len(stale))
 	}
-}
-
-func TestClosedSessionManagerRejectsAcquireFresh(t *testing.T) {
-	manager := NewSessionManager()
-	manager.CloseAll()
-
-	if _, err := manager.AcquireFresh(Config{}); !errors.Is(err, ErrSessionManagerClosed) {
-		t.Fatalf("AcquireFresh after CloseAll = %v, want ErrSessionManagerClosed", err)
+	if got := manager.sessions[key]; len(got) != 1 || got[0].client != healthy {
+		t.Fatalf("healthy tunnel was not kept")
+	}
+	if _, err := manager.Acquire(cfg); !errors.Is(err, ErrFixedPortCapacity) {
+		t.Fatalf("Acquire with a full healthy tunnel = %v, want ErrFixedPortCapacity", err)
 	}
 }
 

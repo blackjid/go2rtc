@@ -392,21 +392,6 @@ func (m *SessionManager) findAvailableSession(key sessionKey) *managedSession {
 // config pins one local UDP port, which cannot be bound by two live tunnels.
 // The caller must call Release when done.
 func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
-	return m.acquire(cfg, true)
-}
-
-// AcquireFresh handshakes a tunnel of its own, ignoring the room left on the
-// live ones. It is how a caller keeps a tunnel in reserve: a reservation on a
-// tunnel that is already carrying streams is worth nothing the moment that
-// tunnel goes deaf to BINDs, which is exactly when a replacement is needed
-// and far too late to start handshaking one.
-//
-// The caller must call Release when done.
-func (m *SessionManager) AcquireFresh(cfg Config) (*Client, error) {
-	return m.acquire(cfg, false)
-}
-
-func (m *SessionManager) acquire(cfg Config, reuse bool) (*Client, error) {
 	key := sessionKeyFor(cfg)
 
 	for {
@@ -415,20 +400,33 @@ func (m *SessionManager) acquire(cfg Config, reuse bool) (*Client, error) {
 			m.mu.Unlock()
 			return nil, ErrSessionManagerClosed
 		}
-		if reuse {
-			if s := m.findAvailableSession(key); s != nil {
-				if s.idleTimer != nil {
-					s.idleTimer.Stop()
-					s.idleTimer = nil
-				}
-				s.refCount++
-				m.mu.Unlock()
-				return s.client, nil
+		if s := m.findAvailableSession(key); s != nil {
+			if s.idleTimer != nil {
+				s.idleTimer.Stop()
+				s.idleTimer = nil
 			}
+			s.refCount++
+			m.mu.Unlock()
+			return s.client, nil
 		}
 		if key.p2pPort != 0 && len(m.sessions[key]) != 0 {
+			// The port admits one tunnel. If it is one that can no longer
+			// take a stream -- retired, or gone silent -- it must make way,
+			// or no new stream starts until it dies on its own: two minutes
+			// for a silent one, never for a retired one still carrying a
+			// stream. Its streams lose their tunnel either way; they
+			// reconnect onto the replacement.
+			stale := m.evictUnusable(key)
+			if len(m.sessions[key]) != 0 {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("%w: %d", ErrFixedPortCapacity, key.p2pPort)
+			}
 			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %d", ErrFixedPortCapacity, key.p2pPort)
+			// Close before handshaking: the replacement binds the same port.
+			for _, s := range stale {
+				s.client.Close()
+			}
+			continue
 		}
 
 		// Another goroutine is already handshaking for this configuration.
@@ -439,7 +437,7 @@ func (m *SessionManager) acquire(cfg Config, reuse bool) (*Client, error) {
 		if inf, ok := m.inflight[key]; ok {
 			m.mu.Unlock()
 			<-inf.done
-			if reuse && inf.err != nil {
+			if inf.err != nil {
 				return nil, inf.err
 			}
 			continue
@@ -484,6 +482,31 @@ func (m *SessionManager) acquire(cfg Config, reuse bool) (*Client, error) {
 		}
 		return client, nil
 	}
+}
+
+// evictUnusable drops the sessions for key that will never take another
+// stream -- retired or silent -- and returns them for the caller to close
+// outside the lock. Must be called with m.mu held.
+func (m *SessionManager) evictUnusable(key sessionKey) []*managedSession {
+	var stale []*managedSession
+	keep := m.sessions[key][:0]
+	for _, s := range m.sessions[key] {
+		if s.client.IsRetired() || !s.client.IsResponsive(deadTunnelSilence) {
+			if s.idleTimer != nil {
+				s.idleTimer.Stop()
+				s.idleTimer = nil
+			}
+			stale = append(stale, s)
+			continue
+		}
+		keep = append(keep, s)
+	}
+	if len(keep) == 0 {
+		delete(m.sessions, key)
+	} else {
+		m.sessions[key] = keep
+	}
+	return stale
 }
 
 // removeSession returns list without s. Must be called with m.mu held.
