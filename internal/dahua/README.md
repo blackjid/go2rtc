@@ -36,7 +36,9 @@ Streams are discoverable from the `/add.html` page by serial and channel count.
 - `p2p_port` pins the local UDP port. P2P requires the device to reply to the
   same source port we punched from, so any NAT that rewrites it — notably
   Kubernetes pod networking — breaks the connection. Pin the port and expose it
-  unchanged with `hostPort` or host networking.
+  unchanged with `hostPort` or host networking. A pinned port carries one
+  tunnel, so when that tunnel stops taking new streams it is torn down and
+  rebuilt, and its existing streams reconnect onto the new one.
 
 ```yaml
 dahua:
@@ -46,5 +48,11 @@ dahua:
 streams:
   camera1: dahua://username:password@SERIAL?channel=1&p2p_port=51234
 ```
+
+## Security
+
+The P2P tunnel is not encrypted. Only the handshake is authenticated; the RTSP
+exchange and the video that follow cross the internet in clear, guarded only by
+a check on the sender's address. Anyone on the path can watch the stream.
 
 Protocol details are in [`pkg/dahua`](../../pkg/dahua/README.md).
