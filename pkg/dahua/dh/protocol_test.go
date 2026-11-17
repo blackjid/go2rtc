@@ -1,6 +1,7 @@
 package dh
 
 import (
+	"encoding/hex"
 	"net"
 	"strings"
 	"testing"
@@ -146,5 +147,22 @@ func TestRandomBytesNotConstant(t *testing.T) {
 	}
 	if equal {
 		t.Fatalf("two successive RandomBytes(16) were identical: %x", a)
+	}
+}
+
+// From dmss_capture.pcap frames 115/116: the request and the device's reply.
+func TestIsSTUNReplyMatchesCapture(t *testing.T) {
+	h := func(s string) []byte { b, _ := hex.DecodeString(s); return b }
+	cookie, transID := h("deed5bbd"), h("cf05a80c6f62bdc17b141a0f")
+	reply := h("fefeffe7deed5bbdcf05a80c6f62bdc17b141a0f7fd6fff7c7cd9ddc1c8bd2c9fffbfff7fffe0c533f57a95c")
+
+	if !isSTUNReply(reply, cookie, transID) {
+		t.Fatal("captured device reply rejected")
+	}
+	if isSTUNReply(reply, cookie, h("000000000000000000000000")) {
+		t.Fatal("reply to another transaction accepted")
+	}
+	if isSTUNReply(reply[:19], cookie, transID) {
+		t.Fatal("short packet accepted")
 	}
 }

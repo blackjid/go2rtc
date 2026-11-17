@@ -1,9 +1,11 @@
 package dh
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -25,6 +27,12 @@ type HandshakeOptions struct {
 	// Device authentication credentials (required for devices with per-device randsalt)
 	DeviceUsername string
 	DevicePassword string
+
+	// Budget bounds the whole handshake (0 = DefaultHandshakeBudget). Each
+	// exchange has its own Timeout, but a dozen of them in a row add up to
+	// minutes, and a caller waiting on a stream should not wait that long to
+	// learn the device is unreachable.
+	Budget time.Duration
 
 	// P2PPort is the local UDP port for the device connection.
 	// Use a fixed port with k8s hostPort to bypass pod-level NAT.
@@ -61,6 +69,11 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	if opts.Timeout == 0 {
 		opts.Timeout = DefaultTimeout
 	}
+	if opts.Budget == 0 {
+		opts.Budget = DefaultHandshakeBudget
+	}
+	deadline := time.Now().Add(opts.Budget)
+	serial := url.PathEscape(opts.Serial)
 
 	var mainClient, p2pClient, deviceClient *UDPClient
 	defer func() {
@@ -83,6 +96,7 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create main client: %w", err)
 	}
+	mainClient.deadline = deadline
 
 	if err = mainClient.Connect(MainServer, MainPort); err != nil {
 		return nil, fmt.Errorf("failed to connect to main server: %w", err)
@@ -99,7 +113,7 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	}
 
 	// Get P2P server for device
-	if err = mainClient.Request(fmt.Sprintf("/online/p2psrv/%s", opts.Serial), ""); err != nil {
+	if err = mainClient.Request(fmt.Sprintf("/online/p2psrv/%s", serial), ""); err != nil {
 		return nil, fmt.Errorf("failed to get p2psrv: %w", err)
 	}
 	p2pResp, err := mainClient.Read()
@@ -125,13 +139,14 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create p2p client: %w", err)
 	}
+	p2pClient.deadline = deadline
 
 	if err = p2pClient.Connect(p2pHost, p2pPort); err != nil {
 		return nil, fmt.Errorf("failed to connect to p2p server: %w", err)
 	}
 
 	// Probe device
-	if err = p2pClient.Request(fmt.Sprintf("/probe/device/%s", opts.Serial), ""); err != nil {
+	if err = p2pClient.Request(fmt.Sprintf("/probe/device/%s", serial), ""); err != nil {
 		return nil, fmt.Errorf("failed to probe device: %w", err)
 	}
 	if _, err = p2pClient.Read(); err != nil {
@@ -139,7 +154,7 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	}
 
 	// Query device info to get randsalt
-	if err = p2pClient.Request(fmt.Sprintf("/info/device/%s", opts.Serial), ""); err != nil {
+	if err = p2pClient.Request(fmt.Sprintf("/info/device/%s", serial), ""); err != nil {
 		return nil, fmt.Errorf("failed to request device info: %w", err)
 	}
 	infoResp, err := p2pClient.Read()
@@ -185,6 +200,7 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create device client: %w", err)
 	}
+	deviceClient.deadline = deadline
 
 	if err = deviceClient.Connect(MainServer, MainPort); err != nil {
 		return nil, fmt.Errorf("failed to connect device client: %w", err)
@@ -195,9 +211,12 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	localAddr := fmt.Sprintf("127.0.0.1:%d", deviceClient.LocalPort())
 
 	var deviceKey []byte
-	var deviceNonce int
+	var deviceNonce uint32
 
 	needsAuth := opts.DeviceUsername != "" && opts.DevicePassword != "" && randsalt != ""
+	if opts.DeviceUsername != "" && !needsAuth {
+		opts.trace("credentials given but the device published no randsalt; using the unauthenticated p2p-channel flow")
+	}
 
 	if needsAuth {
 		deviceKey = GetDeviceKey(opts.DeviceUsername, opts.DevicePassword, randsalt)
@@ -213,14 +232,14 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 		body := fmt.Sprintf("<body>%s<Identify>%s</Identify><IpEncrptV2>true</IpEncrptV2><LocalAddr>%s</LocalAddr><version>5.0.0</version></body>",
 			authXML, formatIdentify(cid), encAddr)
 
-		if err = deviceClient.Request(fmt.Sprintf("/device/%s/p2p-channel", opts.Serial), body); err != nil {
+		if err = deviceClient.Request(fmt.Sprintf("/device/%s/p2p-channel", serial), body); err != nil {
 			return nil, fmt.Errorf("failed to request p2p channel: %w", err)
 		}
 	} else {
 		body := fmt.Sprintf("<body><Identify>%s</Identify><IpEncrpt>true</IpEncrpt><LocalAddr>%s</LocalAddr><version>5.0.0</version></body>",
 			formatIdentify(cid), localAddr)
 
-		if err = deviceClient.Request(fmt.Sprintf("/device/%s/p2p-channel", opts.Serial), body); err != nil {
+		if err = deviceClient.Request(fmt.Sprintf("/device/%s/p2p-channel", serial), body); err != nil {
 			return nil, fmt.Errorf("failed to request p2p channel: %w", err)
 		}
 	}
@@ -310,7 +329,11 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 	if needsAuth {
 		respNonceStr := channelResp.Body["body/Nonce"]
 		if respNonceStr != "" {
-			respNonce, _ := strconv.Atoi(respNonceStr)
+			respNonce, perr := parseNonce(respNonceStr)
+			if perr != nil {
+				err = perr
+				return nil, err
+			}
 			decAddr, decErr := DecryptAddr(deviceKey, respNonce, deviceLAddr)
 			if decErr == nil {
 				deviceLAddr = decAddr
@@ -345,14 +368,17 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 
 	var relayChannelBody string
 	if needsAuth {
-		respNonceStr := channelResp.Body["body/Nonce"]
-		respNonce, _ := strconv.Atoi(respNonceStr)
+		respNonce, perr := parseNonce(channelResp.Body["body/Nonce"])
+		if perr != nil {
+			err = perr
+			return nil, err
+		}
 		relayAuth := GetDeviceAuth(opts.DeviceUsername, deviceKey, respNonce, randsalt, "")
 		relayChannelBody = fmt.Sprintf("<body>%s<agentAddr>%s</agentAddr></body>", relayAuth, agentAddr)
 	} else {
 		relayChannelBody = fmt.Sprintf("<body><agentAddr>%s</agentAddr></body>", agentAddr)
 	}
-	if err = p2pClient.Request(fmt.Sprintf("/device/%s/relay-channel", opts.Serial), relayChannelBody); err != nil {
+	if err = p2pClient.Request(fmt.Sprintf("/device/%s/relay-channel", serial), relayChannelBody); err != nil {
 		return nil, fmt.Errorf("failed to request relay channel: %w", err)
 	}
 
@@ -395,7 +421,9 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 		return nil, fmt.Errorf("direct P2P failed after %d attempts: %w", directRetries, err)
 	}
 
-	// Success: hand ownership of deviceClient to the caller.
+	// Success: hand ownership of deviceClient to the caller, without the
+	// handshake's deadline -- the tunnel reads from it for hours.
+	deviceClient.deadline = time.Time{}
 	keptDeviceClient := deviceClient
 	deviceClient = nil
 	opts.trace("direct P2P connection established serial=%s", opts.Serial)
@@ -527,9 +555,17 @@ func performDirectHandshake(client *UDPClient, cid []byte, devicePubAddr, device
 		if err != nil {
 			return nil, fmt.Errorf("timeout waiting for device response (try relay mode): %w", ErrTimeout)
 		}
-		if sameUDPAddr(respAddr, client.raddr) || sameUDPAddr(respAddr, localAddr) {
-			break
+		if !sameUDPAddr(respAddr, client.raddr) && !sameUDPAddr(respAddr, localAddr) {
+			continue
 		}
+		// Both DMSS captures show the device's reply as fefeffe7 followed by
+		// our cookie and transaction ID, echoed. Anything else from that
+		// address is not an answer to this request.
+		if !isSTUNReply(resp, cookie, transID) {
+			opts.trace("ignoring non-reply from %s len=%d", respAddr, len(resp))
+			continue
+		}
+		break
 	}
 
 	// Reconnect to the address that actually responded
@@ -666,4 +702,27 @@ func drainHandshake(client *UDPClient, session *ptcp.Session) {
 			session.Recv(pkt)
 		}
 	}
+}
+
+// parseNonce reads a device nonce. It is an unsigned 32-bit value; parsing it
+// into an int overflowed on 32-bit platforms, and a wrong nonce derives a wrong
+// key without any error to show for it.
+func parseNonce(s string) (uint32, error) {
+	if s == "" {
+		return 0, nil // what the relay-channel auth has always sent without one
+	}
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid device nonce %q: %w", s, ErrInvalidResponse)
+	}
+	return uint32(n), nil
+}
+
+// isSTUNReply reports whether resp answers the hole-punch request carrying
+// cookie and transID.
+func isSTUNReply(resp, cookie, transID []byte) bool {
+	return len(resp) >= 20 &&
+		bytes.Equal(resp[:4], []byte{0xfe, 0xfe, 0xff, 0xe7}) &&
+		bytes.Equal(resp[4:8], cookie) &&
+		bytes.Equal(resp[8:20], transID)
 }

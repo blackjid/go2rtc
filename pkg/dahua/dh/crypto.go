@@ -7,8 +7,11 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -64,13 +67,14 @@ func GetDeviceKey(username, password, randsalt string) []byte {
 }
 
 // GetDeviceNonce generates a random nonce for device authentication
-func GetDeviceNonce() int {
-	b := RandomBytes(4)
-	return int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3])
+// The nonce is an unsigned 32-bit value: building it in an int went negative
+// on 32-bit platforms for half of all nonces.
+func GetDeviceNonce() uint32 {
+	return binary.BigEndian.Uint32(RandomBytes(4))
 }
 
 // EncryptAddr encrypts a local address using PBKDF2 + AES-OFB
-func EncryptAddr(key []byte, nonce int, data string) (string, error) {
+func EncryptAddr(key []byte, nonce uint32, data string) (string, error) {
 	salt := []byte(fmt.Sprintf("%d", nonce))
 	dk := pbkdf2SHA256(key, salt, 20000, 32)
 
@@ -87,7 +91,7 @@ func EncryptAddr(key []byte, nonce int, data string) (string, error) {
 }
 
 // DecryptAddr decrypts an address using PBKDF2 + AES-OFB
-func DecryptAddr(key []byte, nonce int, data string) (string, error) {
+func DecryptAddr(key []byte, nonce uint32, data string) (string, error) {
 	cipherText, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
 		return "", err
@@ -109,7 +113,7 @@ func DecryptAddr(key []byte, nonce int, data string) (string, error) {
 }
 
 // GetDeviceAuth generates the device authentication XML fragment
-func GetDeviceAuth(username string, key []byte, nonce int, randsalt string, payload string) string {
+func GetDeviceAuth(username string, key []byte, nonce uint32, randsalt string, payload string) string {
 	curdate := time.Now().Unix()
 
 	message := fmt.Sprintf("%d%d%s", nonce, curdate, payload)
@@ -122,7 +126,7 @@ func GetDeviceAuth(username string, key []byte, nonce int, randsalt string, payl
 		"<Nonce>%d</Nonce>"+
 		"<RandSalt>%s</RandSalt>"+
 		"<UserName>%s</UserName>",
-		curdate, auth, nonce, randsalt, username)
+		curdate, auth, nonce, xmlEscape(randsalt), xmlEscape(username))
 }
 
 // pbkdf2SHA256 implements PBKDF2 with SHA-256
@@ -154,4 +158,12 @@ func pbkdf2SHA256(password, salt []byte, iter, keyLen int) []byte {
 	}
 
 	return dk[:keyLen]
+}
+
+// xmlEscape makes s safe to place inside an XML element. Usernames are user
+// configuration, and a '<' or '&' in one must not break the request body.
+func xmlEscape(s string) string {
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
 }

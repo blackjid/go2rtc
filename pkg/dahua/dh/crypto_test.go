@@ -33,7 +33,7 @@ func TestGetDeviceKey(t *testing.T) {
 
 func TestEncryptDecryptAddrRoundTrip(t *testing.T) {
 	key := GetDeviceKey("admin", "password", "SALT1")
-	nonce := 12345
+	nonce := uint32(12345)
 	plain := "127.0.0.1:49300"
 
 	ct, err := EncryptAddr(key, nonce, plain)
@@ -116,5 +116,27 @@ func TestGetDeviceNonceNonZero(t *testing.T) {
 	}
 	if !sawNonZero {
 		t.Fatalf("GetDeviceNonce() returned 0 twenty times in a row")
+	}
+}
+
+// Nonces above 2^31 are half of all nonces; on 32-bit builds an int-based
+// nonce went negative or failed to parse, deriving the wrong key silently.
+func TestParseNonceFullUint32Range(t *testing.T) {
+	n, err := parseNonce("4000000000")
+	if err != nil || n != 4000000000 {
+		t.Fatalf("parseNonce = %d, %v; want 4000000000", n, err)
+	}
+	if _, err := parseNonce("4294967296"); err == nil {
+		t.Fatalf("parseNonce accepted a value past uint32")
+	}
+	if n, err := parseNonce(""); err != nil || n != 0 {
+		t.Fatalf("parseNonce(\"\") = %d, %v; want 0, nil", n, err)
+	}
+}
+
+func TestGetDeviceAuthEscapesUsername(t *testing.T) {
+	got := GetDeviceAuth("a<b&c", []byte("k"), 1, "salt", "")
+	if !strings.Contains(got, "<UserName>a&lt;b&amp;c</UserName>") {
+		t.Fatalf("username not escaped: %s", got)
 	}
 }

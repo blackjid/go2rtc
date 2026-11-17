@@ -2,6 +2,7 @@
 package dh
 
 import (
+	"bytes"
 	cryptorand "crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +28,11 @@ const (
 
 	// DefaultTimeout bounds each request/response exchange with the cloud.
 	DefaultTimeout = 10 * time.Second
+
+	// DefaultHandshakeBudget bounds a whole handshake. A healthy one takes about
+	// three seconds; this leaves room for a slow cloud without letting a
+	// dead device hold a stream for minutes.
+	DefaultHandshakeBudget = 45 * time.Second
 )
 
 // Errors
@@ -142,6 +149,30 @@ type UDPClient struct {
 	raddr   *net.UDPAddr
 	timeout time.Duration
 	cseq    uint32
+
+	// deadline, when set, caps every read: the handshake's overall budget.
+	deadline time.Time
+}
+
+// readBufs holds datagram-sized read buffers. Reading into a fresh 64KB slice
+// and returning a window of it pinned the whole 64KB behind every queued
+// packet; reads now borrow a buffer and return an exact-size copy.
+var readBufs = sync.Pool{New: func() any { b := make([]byte, 65535); return &b }}
+
+// setReadTimeout arms the read deadline for one read, capped by c.deadline.
+// It reports whether a deadline was set, so the caller can clear it after.
+func (c *UDPClient) setReadTimeout(timeout time.Duration) (bool, error) {
+	var d time.Time
+	if timeout > 0 {
+		d = time.Now().Add(timeout)
+	}
+	if !c.deadline.IsZero() && (d.IsZero() || c.deadline.Before(d)) {
+		d = c.deadline
+	}
+	if d.IsZero() {
+		return false, nil
+	}
+	return true, c.conn.SetReadDeadline(d)
 }
 
 // NewUDPClient creates a new UDP client on a random port.
@@ -211,37 +242,37 @@ func (c *UDPClient) SetWriteDeadline(t time.Time) error {
 
 // RecvFrom receives data with timeout and returns the source address.
 func (c *UDPClient) RecvFrom(timeout time.Duration) ([]byte, *net.UDPAddr, error) {
-	if timeout > 0 {
-		if err := c.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-			return nil, nil, err
-		}
+	if set, err := c.setReadTimeout(timeout); err != nil {
+		return nil, nil, err
+	} else if set {
 		defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
 	}
-	buf := make([]byte, 65535)
-	n, addr, err := c.conn.ReadFromUDP(buf)
+	bp := readBufs.Get().(*[]byte)
+	defer readBufs.Put(bp)
+	n, addr, err := c.conn.ReadFromUDP(*bp)
 	if err != nil {
 		return nil, nil, err
 	}
-	return buf[:n], addr, nil
+	return bytes.Clone((*bp)[:n]), addr, nil
 }
 
 // Recv receives data with timeout
 func (c *UDPClient) Recv(timeout time.Duration) ([]byte, error) {
-	if timeout > 0 {
-		if err := c.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-			return nil, err
-		}
+	if set, err := c.setReadTimeout(timeout); err != nil {
+		return nil, err
+	} else if set {
 		defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
 	}
 
-	buf := make([]byte, 65535)
+	bp := readBufs.Get().(*[]byte)
+	defer readBufs.Put(bp)
 	for {
-		n, addr, err := c.conn.ReadFromUDP(buf)
+		n, addr, err := c.conn.ReadFromUDP(*bp)
 		if err != nil {
 			return nil, err
 		}
 		if sameUDPAddr(addr, c.raddr) {
-			return buf[:n], nil
+			return bytes.Clone((*bp)[:n]), nil
 		}
 	}
 }
