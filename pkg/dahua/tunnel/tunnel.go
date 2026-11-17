@@ -135,9 +135,10 @@ type Tunnel struct {
 	nack     chan struct{}
 	nackOnce sync.Once
 
-	// gapSince is when the inbound stream first stalled behind a hole.
-	// Touched only by the reader goroutine.
+	// gapSince is when the inbound stream stalled behind its current hole,
+	// the one at offset gapAt. Touched only by the reader goroutine.
 	gapSince time.Time
+	gapAt    uint32
 
 	// ACK coalescing: batch multiple received packets into a single ACK.
 	// ackMu also guards consecutiveSendErrs, which only flushACK touches.
@@ -415,10 +416,18 @@ func (t *Tunnel) overdue(at time.Time) bool {
 	return heard || age >= max(t.rto, rtoSilent)
 }
 
-// noteGap starts the clock on a hole in the inbound stream.
-func (t *Tunnel) noteGap() {
-	if t.gapSince.IsZero() {
-		t.gapSince = time.Now()
+// trackGap keeps the hole clock on the hole the stream is stuck at now. When
+// one hole fills while data still waits behind a later one, the later hole
+// gets a clock of its own: timing it from the first would skip a hole the
+// device may only just have been asked to fill.
+func (t *Tunnel) trackGap() {
+	if !t.session.Gap() {
+		t.gapSince = time.Time{}
+		return
+	}
+	recv := t.session.Stats().Recv
+	if t.gapSince.IsZero() || recv != t.gapAt {
+		t.gapSince, t.gapAt = time.Now(), recv
 	}
 }
 
@@ -434,6 +443,7 @@ func (t *Tunnel) skipStaleGap() {
 	t.gapSince = time.Time{}
 	ready, skipped := t.session.SkipGap()
 	t.errorf("inbound hole of %d bytes not resent in %s, skipping", skipped, gapSkipAfter)
+	t.trackGap()
 	for _, p := range ready {
 		t.dispatch(p)
 	}
@@ -687,13 +697,14 @@ func (t *Tunnel) outboundStalled() bool {
 		return false
 	}
 
-	// A tunnel nobody has written to proves nothing. The device stops
-	// advancing its Recv counter over an idle tunnel even while it is
-	// perfectly willing to serve the next BIND -- observed closing a tunnel
-	// with two live realms thirty seconds after its last RTSP exchange. Only
-	// realm data the device declines to take is evidence of a stall; total
-	// silence is the missed-heartbeat timeout's business, and it allows six
-	// times as long before concluding anything.
+	// A tunnel nobody has written realm data to proves nothing. Before
+	// offsets were counted in bytes, Recv appeared to freeze on idle tunnels
+	// and this closed one with two live realms thirty seconds after its last
+	// RTSP exchange. The DMSS captures show the device's Recv covering every
+	// heartbeat on a live session, so that freeze was our own miscounting;
+	// the rule stays because only realm data the device declines to take is
+	// evidence of a stall. Total silence is the missed-heartbeat timeout's
+	// business, and it allows six times as long before concluding anything.
 	if written == t.drainPayload {
 		t.lastDrainTime = time.Now()
 		return false
@@ -834,13 +845,11 @@ func (t *Tunnel) reader() {
 		case len(ready) == 0 && packet.Body.Len() > 0:
 			// Data past a hole. Acknowledge at once so the device learns
 			// where we are stuck and resends from there.
-			t.noteGap()
+			t.trackGap()
 			t.flushACK()
 			continue
 		}
-		if !t.session.Gap() {
-			t.gapSince = time.Time{}
-		}
+		t.trackGap()
 		for _, p := range ready {
 			t.dispatch(p)
 		}
@@ -1113,6 +1122,11 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 		return nil, ErrTunnelClosed
 	case <-time.After(bindTimeout):
 		cleanup()
+		// The BIND stays queued for retransmission, so the device may yet
+		// grant the realm. Close it behind the BIND -- PTCP delivers in
+		// order -- so a late grant does not leave a realm open on the device
+		// that nobody owns, counting against its realm limit.
+		_ = t.sendPacket(ptcp.NewStatusBody(realmID, ptcp.StatusDisconnect))
 	}
 
 	t.errorf("bind request unanswered after %s port=%d closed=%v",

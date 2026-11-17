@@ -216,6 +216,10 @@ func (s *Session) Receive(packet *Packet) (ready []*Packet, dup bool) {
 	}
 	switch off := delta(h.Sent, s.recv); {
 	case off < 0:
+		// Behind us, so a duplicate. A packet straddling s.recv would be a
+		// resend cut at different boundaries, which cannot happen: every
+		// datagram carries whole bodies, each with its own 12-byte framing
+		// counted in the offsets, so there is no partial body to keep.
 		return nil, true
 	case off > 0:
 		if s.pending == nil {
@@ -283,7 +287,13 @@ func (s *Session) SkipGap() (ready []*Packet, skipped uint32) {
 func (s *Session) Resend(seq uint32, body *Body) *Packet {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	header := &Header{Sent: seq, Recv: s.recv, LMID: s.lmid(), RMID: s.rmid, PID: s.pid()}
-	s.lastPIDRecv = s.recv
+	header := &Header{Sent: seq, Recv: s.recv, LMID: s.lmid(), RMID: s.rmid}
+	// Same PID rule as Send: a SYNC always carries the SYNC PID, resent or not.
+	if body.Type == BodyTypeSync {
+		header.PID = 0x0002FFFF
+	} else {
+		header.PID = s.pid()
+		s.lastPIDRecv = s.recv
+	}
 	return NewPacket(header, body)
 }

@@ -79,3 +79,10 @@ func TestNackIsNotCounted(t *testing.T) {
 		t.Fatalf("data after a nack at the same offset was dropped")
 	}
 }
+
+func TestResendKeepsSyncPID(t *testing.T) {
+	s := NewSession()
+	if got := s.Resend(0, NewSyncBody()).Header.PID; got != 0x0002FFFF {
+		t.Fatalf("resent SYNC PID = %#x, want 0x0002FFFF", got)
+	}
+}
