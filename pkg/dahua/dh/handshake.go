@@ -526,7 +526,7 @@ func performDirectHandshake(client *UDPClient, cid []byte, devicePubAddr, device
 	}
 	data = append(data, encodedAddr...)
 
-	opts.trace("sending STUN request to device pub=%s local=%s", devicePubAddr, deviceLAddr)
+	opts.trace("sending STUN request to device pub=%s local=%s cookie=%x trans=%x", devicePubAddr, deviceLAddr, cookie, transID)
 
 	if err := client.Send(data); err != nil {
 		return nil, fmt.Errorf("failed to send STUN request: %w", err)
