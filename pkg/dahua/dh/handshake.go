@@ -555,17 +555,17 @@ func performDirectHandshake(client *UDPClient, cid []byte, devicePubAddr, device
 		if err != nil {
 			return nil, fmt.Errorf("timeout waiting for device response (try relay mode): %w", ErrTimeout)
 		}
-		if !sameUDPAddr(respAddr, client.raddr) && !sameUDPAddr(respAddr, localAddr) {
-			continue
+		if sameUDPAddr(respAddr, client.raddr) || sameUDPAddr(respAddr, localAddr) {
+			break
 		}
-		// Both DMSS captures show the device's reply as fefeffe7 followed by
-		// our cookie and transaction ID, echoed. Anything else from that
-		// address is not an answer to this request.
-		if !isSTUNReply(resp, cookie, transID) {
-			opts.trace("ignoring non-reply from %s len=%d", respAddr, len(resp))
-			continue
-		}
-		break
+	}
+	// The DMSS captures show the reply as fefeffe7 + our cookie + our
+	// transaction ID, but a live device answered with 44-byte packets that do
+	// not match that, and rejecting them failed every handshake. Accept the
+	// first packet from the device, as before, and record its head so the
+	// real layout can be pinned down before validating it.
+	if n := min(len(resp), 24); n > 0 {
+		opts.trace("STUN reply head=%x len=%d match=%t", resp[:n], len(resp), isSTUNReply(resp, cookie, transID))
 	}
 
 	// Reconnect to the address that actually responded
