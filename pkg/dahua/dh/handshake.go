@@ -542,30 +542,37 @@ func performDirectHandshake(client *UDPClient, cid []byte, devicePubAddr, device
 		}
 	}
 
-	// Read the first response from the expected public or local device address.
+	// Wait for the device's answer to this request from its public or local
+	// address. A packet from the device that is not that answer -- e.g. a
+	// late reply to an earlier attempt's request -- is kept as a fallback
+	// rather than dropped: before the reply layout was known, rejecting
+	// replies outright failed every handshake.
 	deadline := time.Now().Add(8 * time.Second)
-	var resp []byte
-	var respAddr *net.UDPAddr
+	var resp, fallback []byte
+	var respAddr, fallbackAddr *net.UDPAddr
 	for {
 		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil, fmt.Errorf("timeout waiting for device response (try relay mode): %w", ErrTimeout)
+		var rerr error
+		if remaining > 0 {
+			resp, respAddr, rerr = client.RecvFrom(remaining)
 		}
-		resp, respAddr, err = client.RecvFrom(remaining)
-		if err != nil {
-			return nil, fmt.Errorf("timeout waiting for device response (try relay mode): %w", ErrTimeout)
-		}
-		if sameUDPAddr(respAddr, client.raddr) || sameUDPAddr(respAddr, localAddr) {
+		if remaining <= 0 || rerr != nil {
+			if fallback == nil {
+				return nil, fmt.Errorf("timeout waiting for device response (try relay mode): %w", ErrTimeout)
+			}
+			opts.trace("no STUN reply matched trans=%x, using head=%x", transID, fallback[:min(len(fallback), 24)])
+			resp, respAddr = fallback, fallbackAddr
 			break
 		}
-	}
-	// The DMSS captures show the reply as fefeffe7 + our cookie + our
-	// transaction ID, but a live device answered with 44-byte packets that do
-	// not match that, and rejecting them failed every handshake. Accept the
-	// first packet from the device, as before, and record its head so the
-	// real layout can be pinned down before validating it.
-	if n := min(len(resp), 24); n > 0 {
-		opts.trace("STUN reply head=%x len=%d match=%t", resp[:n], len(resp), isSTUNReply(resp, cookie, transID))
+		if !sameUDPAddr(respAddr, client.raddr) && !sameUDPAddr(respAddr, localAddr) {
+			continue
+		}
+		if isSTUNReply(resp, transID) {
+			break
+		}
+		if fallback == nil {
+			fallback, fallbackAddr = resp, respAddr
+		}
 	}
 
 	// Reconnect to the address that actually responded
@@ -719,10 +726,11 @@ func parseNonce(s string) (uint32, error) {
 }
 
 // isSTUNReply reports whether resp answers the hole-punch request carrying
-// cookie and transID.
-func isSTUNReply(resp, cookie, transID []byte) bool {
+// transID. The device replies fefeffe7, then deed5bbd -- a constant, not an
+// echo of our cookie (DMSS happens to send that same value as its cookie) --
+// then our transaction ID. Seen in two live handshakes and both captures.
+func isSTUNReply(resp, transID []byte) bool {
 	return len(resp) >= 20 &&
 		bytes.Equal(resp[:4], []byte{0xfe, 0xfe, 0xff, 0xe7}) &&
-		bytes.Equal(resp[4:8], cookie) &&
 		bytes.Equal(resp[8:20], transID)
 }

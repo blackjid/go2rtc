@@ -150,19 +150,24 @@ func TestRandomBytesNotConstant(t *testing.T) {
 	}
 }
 
-// From dmss_capture.pcap frames 115/116: the request and the device's reply.
-func TestIsSTUNReplyMatchesCapture(t *testing.T) {
+// Device replies: dmss_capture.pcap frame 116, and a live handshake on
+// 2026-11-16 whose cookie (069c1e04) was not echoed -- deed5bbd is a constant.
+func TestIsSTUNReplyMatchesDevice(t *testing.T) {
 	h := func(s string) []byte { b, _ := hex.DecodeString(s); return b }
-	cookie, transID := h("deed5bbd"), h("cf05a80c6f62bdc17b141a0f")
-	reply := h("fefeffe7deed5bbdcf05a80c6f62bdc17b141a0f7fd6fff7c7cd9ddc1c8bd2c9fffbfff7fffe0c533f57a95c")
-
-	if !isSTUNReply(reply, cookie, transID) {
-		t.Fatal("captured device reply rejected")
+	tests := []struct{ reply, trans string }{
+		{"fefeffe7deed5bbdcf05a80c6f62bdc17b141a0f7fd6fff7c7cd9ddc1c8bd2c9fffbfff7fffe0c533f57a95c", "cf05a80c6f62bdc17b141a0f"},
+		{"fefeffe7deed5bbdaa632721444c3f510f9b42c77fd6fff7", "aa632721444c3f510f9b42c7"},
 	}
-	if isSTUNReply(reply, cookie, h("000000000000000000000000")) {
-		t.Fatal("reply to another transaction accepted")
-	}
-	if isSTUNReply(reply[:19], cookie, transID) {
-		t.Fatal("short packet accepted")
+	for _, tt := range tests {
+		reply := h(tt.reply)
+		if !isSTUNReply(reply, h(tt.trans)) {
+			t.Fatalf("device reply rejected: %s", tt.reply)
+		}
+		if isSTUNReply(reply, h("000000000000000000000000")) {
+			t.Fatal("reply to another transaction accepted")
+		}
+		if isSTUNReply(reply[:19], h(tt.trans)) {
+			t.Fatal("short packet accepted")
+		}
 	}
 }
